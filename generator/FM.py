@@ -39,6 +39,123 @@ class FMGenerator(nn.Module):
         
         self._print_model_stats()
 
+    def _predict_chunk_velocity(
+        self,
+        z_t,
+        t_value,
+        a_t,
+        prev_x_t,
+        prev_a_t,
+        ref_x,
+        gaze_t,
+        prev_gaze_t,
+        pose_t,
+        prev_pose_t,
+        cam_t,
+        prev_cam_t,
+        a_cfg_scale,
+    ):
+        out = self.fmt.forward_with_cfg(
+            t=t_value,
+            x=z_t,
+            a=a_t,
+            prev_x=prev_x_t,
+            prev_a=prev_a_t,
+            ref_x=ref_x,
+            gaze=gaze_t,
+            prev_gaze=prev_gaze_t,
+            pose=pose_t,
+            prev_pose=prev_pose_t,
+            cam=cam_t,
+            prev_cam=prev_cam_t,
+            a_cfg_scale=a_cfg_scale,
+        )
+        return out[:, self.num_prev_frames:]
+
+    def _sample_chunk_with_ode(
+        self,
+        x0,
+        time_steps,
+        a_t,
+        prev_x_t,
+        prev_a_t,
+        ref_x,
+        gaze_t,
+        prev_gaze_t,
+        pose_t,
+        prev_pose_t,
+        cam_t,
+        prev_cam_t,
+        a_cfg_scale,
+    ):
+        def sample_chunk(tt, zt):
+            t_value = tt.unsqueeze(0)
+            return self._predict_chunk_velocity(
+                z_t=zt,
+                t_value=t_value,
+                a_t=a_t,
+                prev_x_t=prev_x_t,
+                prev_a_t=prev_a_t,
+                ref_x=ref_x,
+                gaze_t=gaze_t,
+                prev_gaze_t=prev_gaze_t,
+                pose_t=pose_t,
+                prev_pose_t=prev_pose_t,
+                cam_t=cam_t,
+                prev_cam_t=prev_cam_t,
+                a_cfg_scale=a_cfg_scale,
+            )
+
+        trajectory_t = odeint(sample_chunk, x0, time_steps, **self.odeint_kwargs)
+        return trajectory_t[-1]
+
+    def _sample_chunk_with_imf(
+        self,
+        x0,
+        num_steps,
+        a_t,
+        prev_x_t,
+        prev_a_t,
+        ref_x,
+        gaze_t,
+        prev_gaze_t,
+        pose_t,
+        prev_pose_t,
+        cam_t,
+        prev_cam_t,
+        a_cfg_scale,
+    ):
+        # Approximate iMeanFlow-style transport with fixed interval updates over the
+        # existing PyTorch motion field. This keeps the IMTalker checkpoint usable
+        # without trying to drop a JAX image model into the motion generator.
+        z_t = x0
+        step_schedule = torch.linspace(0.0, 1.0, num_steps + 1, device=x0.device, dtype=x0.dtype)
+
+        for idx in range(num_steps):
+            t_start = step_schedule[idx]
+            t_end = step_schedule[idx + 1]
+            delta_t = t_end - t_start
+            t_mid = ((t_start + t_end) * 0.5).unsqueeze(0)
+
+            avg_velocity = self._predict_chunk_velocity(
+                z_t=z_t,
+                t_value=t_mid,
+                a_t=a_t,
+                prev_x_t=prev_x_t,
+                prev_a_t=prev_a_t,
+                ref_x=ref_x,
+                gaze_t=gaze_t,
+                prev_gaze_t=prev_gaze_t,
+                pose_t=pose_t,
+                prev_pose_t=prev_pose_t,
+                cam_t=cam_t,
+                prev_cam_t=prev_cam_t,
+                a_cfg_scale=a_cfg_scale,
+            )
+            z_t = z_t + delta_t * avg_velocity
+
+        return z_t
+
     def _make_projection(self, in_dim, out_dim):
         return nn.Sequential(
             nn.Linear(in_dim, out_dim),
@@ -102,7 +219,7 @@ class FMGenerator(nn.Module):
         return tensor
 
     @torch.no_grad()
-    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None):
+    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None, sampler=None):
         a, ref_x = data['a'], data['ref_x']
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
@@ -110,7 +227,8 @@ class FMGenerator(nn.Module):
         
         B = a.shape[0]
         device = self.rank
-        time_steps = torch.linspace(0, 1, nfe, device=device)
+        sampler = (sampler or getattr(self.opt, "motion_sampler", "imf")).lower()
+        nfe = max(int(nfe), 1)
 
         # Process Audio
         a = a.to(device)
@@ -190,24 +308,41 @@ class FMGenerator(nn.Module):
                 pose_t = pad_tensor(pose_t)
                 cam_t = pad_tensor(cam_t)
 
-            # ODE Solver Function
-            def sample_chunk(tt, zt):
-                out = self.fmt.forward_with_cfg(
-                    t=tt.unsqueeze(0),
-                    x=zt,
-                    a=a_t,
-                    prev_x=prev_x_t,
-                    prev_a=prev_a_t,
+            if sampler == "ode":
+                time_steps = torch.linspace(0, 1, max(nfe, 2), device=device, dtype=x0.dtype)
+                sample_t = self._sample_chunk_with_ode(
+                    x0=x0,
+                    time_steps=time_steps,
+                    a_t=a_t,
+                    prev_x_t=prev_x_t,
+                    prev_a_t=prev_a_t,
                     ref_x=ref_x,
-                    gaze=gaze_t, prev_gaze=prev_gaze_t,
-                    pose=pose_t, prev_pose=prev_pose_t,
-                    cam=cam_t, prev_cam=prev_cam_t,
+                    gaze_t=gaze_t,
+                    prev_gaze_t=prev_gaze_t,
+                    pose_t=pose_t,
+                    prev_pose_t=prev_pose_t,
+                    cam_t=cam_t,
+                    prev_cam_t=prev_cam_t,
                     a_cfg_scale=a_cfg_scale,
                 )
-                return out[:, self.num_prev_frames:]
-
-            trajectory_t = odeint(sample_chunk, x0, time_steps, **self.odeint_kwargs)
-            sample_t = trajectory_t[-1]
+            elif sampler == "imf":
+                sample_t = self._sample_chunk_with_imf(
+                    x0=x0,
+                    num_steps=nfe,
+                    a_t=a_t,
+                    prev_x_t=prev_x_t,
+                    prev_a_t=prev_a_t,
+                    ref_x=ref_x,
+                    gaze_t=gaze_t,
+                    prev_gaze_t=prev_gaze_t,
+                    pose_t=pose_t,
+                    prev_pose_t=prev_pose_t,
+                    cam_t=cam_t,
+                    prev_cam_t=prev_cam_t,
+                    a_cfg_scale=a_cfg_scale,
+                )
+            else:
+                raise ValueError(f"Unknown motion sampler: {sampler}")
             sample.append(sample_t)
 
         sample = torch.cat(sample, dim=1)[:, :T]

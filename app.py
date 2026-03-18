@@ -107,6 +107,7 @@ class AppConfig:
         self.ode_atol = 1e-5
         self.ode_rtol = 1e-5
         self.nfe = 10
+        self.motion_sampler = "imf"
         self.torchdiffeq_ode_method = 'euler'
         self.a_cfg_scale = 3.0
         self.swin_res_threshold = 128
@@ -312,7 +313,7 @@ class InferenceAgent:
             return raw_path
 
     @torch.no_grad()
-    def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+    def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale, sampler):
         s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
@@ -322,7 +323,13 @@ class InferenceAgent:
         if isinstance(t_lat, tuple): t_lat = t_lat[0]
         data['ref_x'] = t_lat
         torch.manual_seed(seed)
-        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+        sample = self.generator.sample(
+            data,
+            a_cfg_scale=cfg_scale,
+            nfe=nfe,
+            seed=seed,
+            sampler=sampler,
+        )
         d_hat = []
         T = sample.shape[1]
         ta_r = self.renderer.adapt(t_lat, g_r)
@@ -386,13 +393,21 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, progress=gr.Progress()):
+def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, sampler, progress=gr.Progress()):
     if agent is None: raise gr.Error("Models not loaded properly. Check logs.")
     if image is None or audio is None: raise gr.Error("Missing image or audio.")
     
     img_pil = Image.fromarray(image).convert('RGB')
     try:
-        return agent.run_audio_inference(img_pil, audio, crop, int(seed), int(nfe), float(cfg_scale))
+        return agent.run_audio_inference(
+            img_pil,
+            audio,
+            crop,
+            int(seed),
+            int(nfe),
+            float(cfg_scale),
+            sampler,
+        )
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -473,13 +488,18 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                         a_seed = gr.Number(label="Seed", value=42)
                         a_nfe = gr.Slider(5, 50, value=10, step=1, label="Steps (NFE)")
                         a_cfg = gr.Slider(1.0, 5.0, value=2.0, label="CFG Scale")
+                        a_sampler = gr.Dropdown(
+                            choices=["imf", "ode"],
+                            value=cfg.motion_sampler,
+                            label="Motion Sampler",
+                        )
                         
                     a_btn = gr.Button("Generate (Audio Driven)", variant="primary")
                     
                 with gr.Column():
                     a_out = gr.Video(label="Result", height=512, width=512)
             
-            a_btn.click(fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg], a_out)
+            a_btn.click(fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg, a_sampler], a_out)
 
         # ==========================
         # Tab 2: Video Driven

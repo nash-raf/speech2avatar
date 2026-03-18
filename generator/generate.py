@@ -176,7 +176,13 @@ class InferenceAgent:
         f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
         data["ref_x"] = t_r
 
-        sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
+        sample = self.fm.sample(
+            data,
+            a_cfg_scale=kwargs.get('a_cfg_scale', 1.0),
+            nfe=kwargs.get('nfe', 10),
+            seed=kwargs.get('seed', 25),
+            sampler=kwargs.get('motion_sampler', self.opt.motion_sampler),
+        )
         data_out = self.decode_image(f_r, t_r, sample, g_r)
         
         return self.save_video(data_out["d_hat"], res_path, aud_path)
@@ -232,7 +238,11 @@ def process_item(agent, ref, aud, name, opt):
     try:
         agent.run_inference(
             out_path, ref, aud, pose, gaze,
-            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed
+            a_cfg_scale=opt.a_cfg_scale,
+            nfe=opt.nfe,
+            crop=opt.crop,
+            seed=opt.seed,
+            motion_sampler=opt.motion_sampler,
         )
     except Exception as e:
         print(f"Error processing {name}: {e}")
@@ -268,6 +278,5 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
-
 
 
