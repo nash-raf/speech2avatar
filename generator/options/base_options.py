@@ -53,8 +53,6 @@ class BaseOptions():
 		parser.add_argument('--ode_rtol', default=1e-5, type=float)
 		parser.add_argument('--nfe', default=10, type=int,
 							help='Number of Function Evaluateions (NFEs) for ODE solver')
-		parser.add_argument('--motion_sampler', default='imf', choices=['imf', 'ode'],
-							help='motion sampler for the audio-driven generator')
 		parser.add_argument('--torchdiffeq_ode_method', default='euler',
 							help='ODE solver')
 		parser.add_argument('--a_cfg_scale', default=3, type=float,
@@ -93,3 +91,4 @@ def load_options(opt, load_path):
 		_update = json.loads(f)
 	opt.update(_update)
 	return opt
+

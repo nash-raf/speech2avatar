@@ -1,4 +1,3 @@
-import math
 import os
 import sys
 import tempfile
@@ -108,7 +107,6 @@ class AppConfig:
         self.ode_atol = 1e-5
         self.ode_rtol = 1e-5
         self.nfe = 10
-        self.motion_sampler = "imf"
         self.torchdiffeq_ode_method = 'euler'
         self.a_cfg_scale = 3.0
         self.swin_res_threshold = 128
@@ -313,45 +311,18 @@ class InferenceAgent:
         else:
             return raw_path
 
-    def _build_static_spatial_controls(self, audio_tensor):
-        batch_size = audio_tensor.shape[0]
-        seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-        control_kwargs = {
-            "device": audio_tensor.device,
-            "dtype": audio_tensor.dtype,
-        }
-        return {
-            "pose": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
-            "cam": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
-            "gaze": torch.zeros(batch_size, seq_len, 2, **control_kwargs),
-        }
-
     @torch.no_grad()
-    def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale, sampler):
+    def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
         s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
-        static_controls = self._build_static_spatial_controls(a_tensor)
-        data = {
-            's': s_tensor,
-            'a': a_tensor,
-            'pose': static_controls['pose'],
-            'cam': static_controls['cam'],
-            'gaze': static_controls['gaze'],
-            'ref_x': None,
-        }
+        data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': None}
         f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
         t_lat = self.renderer.latent_token_encoder(s_tensor)
         if isinstance(t_lat, tuple): t_lat = t_lat[0]
         data['ref_x'] = t_lat
         torch.manual_seed(seed)
-        sample = self.generator.sample(
-            data,
-            a_cfg_scale=cfg_scale,
-            nfe=nfe,
-            seed=seed,
-            sampler=sampler,
-        )
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
         d_hat = []
         T = sample.shape[1]
         ta_r = self.renderer.adapt(t_lat, g_r)
@@ -415,21 +386,13 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
-def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, sampler, progress=gr.Progress()):
+def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, progress=gr.Progress()):
     if agent is None: raise gr.Error("Models not loaded properly. Check logs.")
     if image is None or audio is None: raise gr.Error("Missing image or audio.")
     
     img_pil = Image.fromarray(image).convert('RGB')
     try:
-        return agent.run_audio_inference(
-            img_pil,
-            audio,
-            crop,
-            int(seed),
-            int(nfe),
-            float(cfg_scale),
-            sampler,
-        )
+        return agent.run_audio_inference(img_pil, audio, crop, int(seed), int(nfe), float(cfg_scale))
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -510,18 +473,13 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                         a_seed = gr.Number(label="Seed", value=42)
                         a_nfe = gr.Slider(5, 50, value=10, step=1, label="Steps (NFE)")
                         a_cfg = gr.Slider(1.0, 5.0, value=2.0, label="CFG Scale")
-                        a_sampler = gr.Dropdown(
-                            choices=["imf", "ode"],
-                            value=cfg.motion_sampler,
-                            label="Motion Sampler",
-                        )
                         
                     a_btn = gr.Button("Generate (Audio Driven)", variant="primary")
                     
                 with gr.Column():
                     a_out = gr.Video(label="Result", height=512, width=512)
             
-            a_btn.click(fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg, a_sampler], a_out)
+            a_btn.click(fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg], a_out)
 
         # ==========================
         # Tab 2: Video Driven

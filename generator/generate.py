@@ -1,4 +1,3 @@
-import math
 import os
 import datetime
 import random
@@ -160,40 +159,24 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
-    def _build_static_spatial_controls(self, audio_tensor):
-        batch_size = audio_tensor.shape[0]
-        seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-        control_kwargs = {
-            "device": audio_tensor.device,
-            "dtype": audio_tensor.dtype,
-        }
-        return {
-            "pose": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
-            "cam": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
-            "gaze": torch.zeros(batch_size, seq_len, 2, **control_kwargs),
-        }
-
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
         data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
-        data["s"] = data["s"].to(self.opt.rank)
-        data["a"] = data["a"].to(self.opt.rank)
-
-        static_controls = self._build_static_spatial_controls(data["a"])
-        data["pose"] = static_controls["pose"]
-        data["cam"] = static_controls["cam"]
-        data["gaze"] = static_controls["gaze"]
         
-        f_r, t_r, g_r = self.encode_image(data["s"])
+        if pose_path and os.path.exists(pose_path):
+            data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
+        else:
+            data["pose"], data["cam"] = None, None
+
+        if gaze_path and os.path.exists(gaze_path):
+            data["gaze"] = torch.tensor(np.load(gaze_path), dtype=torch.float32).cuda()
+        else:
+            data["gaze"] = None
+        
+        f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
         data["ref_x"] = t_r
 
-        sample = self.fm.sample(
-            data,
-            a_cfg_scale=kwargs.get('a_cfg_scale', 1.0),
-            nfe=kwargs.get('nfe', 10),
-            seed=kwargs.get('seed', 25),
-            sampler=kwargs.get('motion_sampler', self.opt.motion_sampler),
-        )
+        sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
         data_out = self.decode_image(f_r, t_r, sample, g_r)
         
         return self.save_video(data_out["d_hat"], res_path, aud_path)
@@ -249,11 +232,7 @@ def process_item(agent, ref, aud, name, opt):
     try:
         agent.run_inference(
             out_path, ref, aud, pose, gaze,
-            a_cfg_scale=opt.a_cfg_scale,
-            nfe=opt.nfe,
-            crop=opt.crop,
-            seed=opt.seed,
-            motion_sampler=opt.motion_sampler,
+            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed
         )
     except Exception as e:
         print(f"Error processing {name}: {e}")
@@ -289,4 +268,6 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
+
+
 
