@@ -1,3 +1,4 @@
+import math
 import os
 import datetime
 import random
@@ -159,21 +160,31 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
+    def _build_static_spatial_controls(self, audio_tensor):
+        batch_size = audio_tensor.shape[0]
+        seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+        control_kwargs = {
+            "device": audio_tensor.device,
+            "dtype": audio_tensor.dtype,
+        }
+        return {
+            "pose": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
+            "cam": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
+            "gaze": torch.zeros(batch_size, seq_len, 2, **control_kwargs),
+        }
+
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
         data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
-        
-        if pose_path and os.path.exists(pose_path):
-            data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
-        else:
-            data["pose"], data["cam"] = None, None
+        data["s"] = data["s"].to(self.opt.rank)
+        data["a"] = data["a"].to(self.opt.rank)
 
-        if gaze_path and os.path.exists(gaze_path):
-            data["gaze"] = torch.tensor(np.load(gaze_path), dtype=torch.float32).cuda()
-        else:
-            data["gaze"] = None
+        static_controls = self._build_static_spatial_controls(data["a"])
+        data["pose"] = static_controls["pose"]
+        data["cam"] = static_controls["cam"]
+        data["gaze"] = static_controls["gaze"]
         
-        f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
+        f_r, t_r, g_r = self.encode_image(data["s"])
         data["ref_x"] = t_r
 
         sample = self.fm.sample(
@@ -278,5 +289,4 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
-
 
