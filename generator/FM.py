@@ -85,20 +85,35 @@ class FMGenerator(nn.Module):
 
         return pred[:, self.num_prev_frames:, ...]
 
-    def _align_sequence(self, tensor, target_len):
-        """Helper to crop or pad sequences to target length."""
+    def _prepare_condition_sequence(self, tensor, target_len, batch_size, feature_dim, device, dtype):
         if tensor is None:
-            return None
-            
-        tensor = tensor.to(self.rank)
-        curr_len = tensor.shape[0]
-        
+            return torch.zeros(batch_size, target_len, feature_dim, device=device, dtype=dtype)
+
+        tensor = tensor.to(device=device, dtype=dtype)
+        if tensor.dim() == 2:
+            tensor = tensor.unsqueeze(0)
+        elif tensor.dim() != 3:
+            raise ValueError(f"Expected condition tensor with 2 or 3 dims, got shape {tuple(tensor.shape)}")
+
+        if tensor.shape[-1] != feature_dim:
+            raise ValueError(
+                f"Expected condition feature dim {feature_dim}, got {tensor.shape[-1]} for shape {tuple(tensor.shape)}"
+            )
+
+        if tensor.shape[0] == 1 and batch_size > 1:
+            tensor = tensor.expand(batch_size, -1, -1)
+        elif tensor.shape[0] != batch_size:
+            raise ValueError(
+                f"Expected condition batch size {batch_size}, got {tensor.shape[0]} for shape {tuple(tensor.shape)}"
+            )
+
+        curr_len = tensor.shape[1]
         if curr_len > target_len:
-            return tensor[:target_len]
+            tensor = tensor[:, :target_len]
         elif curr_len < target_len:
             pad_len = target_len - curr_len
-            padding = torch.zeros(pad_len, tensor.shape[1], device=tensor.device)
-            return torch.cat([tensor, padding], dim=0)
+            padding = torch.zeros(batch_size, pad_len, feature_dim, device=device, dtype=dtype)
+            tensor = torch.cat([tensor, padding], dim=1)
         return tensor
 
     @torch.no_grad()
@@ -114,30 +129,21 @@ class FMGenerator(nn.Module):
 
         # Process Audio
         a = a.to(device)
+        device = a.device
+        ref_x = ref_x.to(device)
         T = math.ceil(a.shape[-1] * self.fps / self.opt.sampling_rate)
         a = self.audio_encoder.inference(a, seq_len=T)
         a = self.audio_projection(a)
 
         # Process Conditions (Gaze, Pose, Cam)
-        gaze = self._align_sequence(gaze_raw, T)
-        pose = self._align_sequence(pose_raw, T)
-        cam = self._align_sequence(cam_raw, T)
+        cond_dtype = a.dtype
+        gaze = self._prepare_condition_sequence(gaze_raw, T, B, 2, device, cond_dtype)
+        pose = self._prepare_condition_sequence(pose_raw, T, B, 3, device, cond_dtype)
+        cam = self._prepare_condition_sequence(cam_raw, T, B, 3, device, cond_dtype)
 
-        # Project or Create Null Embeddings
-        if gaze is not None:
-            gaze = self.gaze_projection(gaze).unsqueeze(0)
-        else:
-            gaze = torch.zeros(B, T, self.opt.dim_c, device=device)
-
-        if pose is not None:
-            pose = self.pose_projection(pose).unsqueeze(0)
-        else:
-            pose = torch.zeros(B, T, self.opt.dim_c, device=device)
-
-        if cam is not None:
-            cam = self.cam_projection(cam).unsqueeze(0)
-        else:
-            cam = torch.zeros(B, T, self.opt.dim_c, device=device)
+        gaze = self.gaze_projection(gaze)
+        pose = self.pose_projection(pose)
+        cam = self.cam_projection(cam)
 
         # Generation Loop
         sample = []

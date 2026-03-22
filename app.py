@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import tempfile
@@ -311,12 +312,33 @@ class InferenceAgent:
         else:
             return raw_path
 
+    def _build_static_spatial_controls(self, audio_tensor):
+        batch_size = audio_tensor.shape[0]
+        seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+        control_kwargs = {
+            "device": audio_tensor.device,
+            "dtype": audio_tensor.dtype,
+        }
+        return {
+            "pose": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
+            "cam": torch.zeros(batch_size, seq_len, 3, **control_kwargs),
+            "gaze": torch.zeros(batch_size, seq_len, 2, **control_kwargs),
+        }
+
     @torch.no_grad()
     def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
         s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
-        data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': None}
+        static_controls = self._build_static_spatial_controls(a_tensor)
+        data = {
+            's': s_tensor,
+            'a': a_tensor,
+            'pose': static_controls['pose'],
+            'cam': static_controls['cam'],
+            'gaze': static_controls['gaze'],
+            'ref_x': None,
+        }
         f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
         t_lat = self.renderer.latent_token_encoder(s_tensor)
         if isinstance(t_lat, tuple): t_lat = t_lat[0]
