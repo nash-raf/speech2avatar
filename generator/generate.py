@@ -160,16 +160,33 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
-    def _build_zero_pose_sequence(self, audio_tensor):
+    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None):
         batch_size = audio_tensor.shape[0]
         seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-        return torch.zeros(
-            batch_size,
-            seq_len,
-            3,
-            device=audio_tensor.device,
-            dtype=audio_tensor.dtype,
-        )
+        device = audio_tensor.device
+        dtype = audio_tensor.dtype
+
+        if pose_sequence is None:
+            return torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+
+        pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+        if pose_sequence.dim() == 2:
+            pose_sequence = pose_sequence.unsqueeze(0)
+        elif pose_sequence.dim() != 3:
+            raise ValueError(f"Expected pose sequence with 2 or 3 dims, got shape {tuple(pose_sequence.shape)}")
+
+        if pose_sequence.shape[-1] != 3:
+            raise ValueError(f"Expected pose feature dim 3, got {pose_sequence.shape[-1]}")
+
+        if pose_sequence.shape[0] == 1 and batch_size > 1:
+            pose_sequence = pose_sequence.expand(batch_size, -1, -1)
+        elif pose_sequence.shape[0] != batch_size:
+            raise ValueError(
+                f"Expected pose batch size {batch_size}, got {pose_sequence.shape[0]} for shape {tuple(pose_sequence.shape)}"
+            )
+
+        resting_pose = pose_sequence[:, :1, :]
+        return resting_pose.expand(batch_size, seq_len, 3).clone()
 
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
@@ -178,22 +195,22 @@ class InferenceAgent:
         data["a"] = data["a"].to(self.opt.rank)
 
         batch_size = data["a"].shape[0]
-        seq_len = math.ceil(data["a"].shape[-1] * self.opt.fps / self.opt.sampling_rate)
         device = data["a"].device
         dtype = data["a"].dtype
 
-        data["pose"] = self._build_zero_pose_sequence(data["a"])
+        pose_sequence = None
+        if pose_path and os.path.exists(pose_path):
+            pose_sequence, data["cam"] = load_smirk_params(torch.load(pose_path))
+            data["cam"] = data["cam"].to(device=device, dtype=dtype)
+        else:
+            data["cam"] = None
+
+        data["pose"] = self._build_static_pose_sequence(data["a"], pose_sequence)
 
         if gaze_path and os.path.exists(gaze_path):
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
         else:
             data["gaze"] = None
-
-        if pose_path and os.path.exists(pose_path):
-            _, data["cam"] = load_smirk_params(torch.load(pose_path))
-            data["cam"] = data["cam"].to(device=device, dtype=dtype)
-        else:
-            data["cam"] = None
 
         f_r, t_r, g_r = self.encode_image(data["s"])
         data["ref_x"] = t_r
@@ -290,4 +307,3 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
-

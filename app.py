@@ -27,6 +27,12 @@ except ImportError as e:
     print(f"Import Error: {e}")
     print("Please ensure 'generator' and 'renderer' folders are in the same directory.")
 
+
+def load_smirk_params(smirk_data):
+    pose = smirk_data["pose_params"]
+    cam = smirk_data["cam"]
+    return pose, cam
+
 # ==========================================
 # Automatic Model Download Logic
 # ==========================================
@@ -312,26 +318,46 @@ class InferenceAgent:
         else:
             return raw_path
 
-    def _build_zero_pose_sequence(self, audio_tensor):
+    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None):
         batch_size = audio_tensor.shape[0]
         seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-        return torch.zeros(
-            batch_size,
-            seq_len,
-            3,
-            device=audio_tensor.device,
-            dtype=audio_tensor.dtype,
-        )
+        device = audio_tensor.device
+        dtype = audio_tensor.dtype
+
+        if pose_sequence is None:
+            return torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+
+        pose_sequence = pose_sequence.to(device=device, dtype=dtype)
+        if pose_sequence.dim() == 2:
+            pose_sequence = pose_sequence.unsqueeze(0)
+        elif pose_sequence.dim() != 3:
+            raise ValueError(f"Expected pose sequence with 2 or 3 dims, got shape {tuple(pose_sequence.shape)}")
+
+        if pose_sequence.shape[-1] != 3:
+            raise ValueError(f"Expected pose feature dim 3, got {pose_sequence.shape[-1]}")
+
+        if pose_sequence.shape[0] == 1 and batch_size > 1:
+            pose_sequence = pose_sequence.expand(batch_size, -1, -1)
+        elif pose_sequence.shape[0] != batch_size:
+            raise ValueError(
+                f"Expected pose batch size {batch_size}, got {pose_sequence.shape[0]} for shape {tuple(pose_sequence.shape)}"
+            )
+
+        resting_pose = pose_sequence[:, :1, :]
+        return resting_pose.expand(batch_size, seq_len, 3).clone()
 
     @torch.no_grad()
     def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
         s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+        pose_sequence = None
+        if self.opt.pose_path and os.path.exists(self.opt.pose_path):
+            pose_sequence, _ = load_smirk_params(torch.load(self.opt.pose_path, map_location="cpu"))
         data = {
             's': s_tensor,
             'a': a_tensor,
-            'pose': self._build_zero_pose_sequence(a_tensor),
+            'pose': self._build_static_pose_sequence(a_tensor, pose_sequence),
             'cam': None,
             'gaze': None,
             'ref_x': None,
