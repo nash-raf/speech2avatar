@@ -135,15 +135,23 @@ class FMGenerator(nn.Module):
         a = self.audio_encoder.inference(a, seq_len=T)
         a = self.audio_projection(a)
 
-        # Process Conditions (Gaze, Pose, Cam)
+        # Pose is explicitly controlled, while omitted cam/gaze keep IMTalker's
+        # original null-conditioning behavior.
         cond_dtype = a.dtype
-        gaze = self._prepare_condition_sequence(gaze_raw, T, B, 2, device, cond_dtype)
         pose = self._prepare_condition_sequence(pose_raw, T, B, 3, device, cond_dtype)
-        cam = self._prepare_condition_sequence(cam_raw, T, B, 3, device, cond_dtype)
-
-        gaze = self.gaze_projection(gaze)
         pose = self.pose_projection(pose)
-        cam = self.cam_projection(cam)
+
+        if gaze_raw is not None:
+            gaze = self._prepare_condition_sequence(gaze_raw, T, B, 2, device, cond_dtype)
+            gaze = self.gaze_projection(gaze)
+        else:
+            gaze = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
+
+        if cam_raw is not None:
+            cam = self._prepare_condition_sequence(cam_raw, T, B, 3, device, cond_dtype)
+            cam = self.cam_projection(cam)
+        else:
+            cam = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
 
         # Generation Loop
         sample = []
