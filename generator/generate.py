@@ -1,5 +1,6 @@
 import math
 import os
+import time
 import datetime
 import random
 import tempfile
@@ -204,6 +205,9 @@ class InferenceAgent:
 
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
+        t_total_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
         data["s"] = data["s"].to(self.opt.rank)
         data["a"] = data["a"].to(self.opt.rank)
@@ -225,14 +229,46 @@ class InferenceAgent:
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
         else:
             data["gaze"] = None
+        preprocess_sec = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         f_r, t_r, g_r = self.encode_image(data["s"])
         data["ref_x"] = t_r
+        encode_sec = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
+        torch.cuda.synchronize()
+        motion_gen_sec = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         data_out = self.decode_image(f_r, t_r, sample, g_r)
-        
-        return self.save_video(data_out["d_hat"], res_path, aud_path)
+        torch.cuda.synchronize()
+        render_sec = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        result = self.save_video(data_out["d_hat"], res_path, aud_path)
+        save_sec = time.perf_counter() - t0
+
+        total_sec = time.perf_counter() - t_total_start
+        num_frames = sample.shape[1]
+        fps_actual = num_frames / total_sec
+
+        print(f"\n{'='*50}")
+        print(f"  Inference Timing Summary")
+        print(f"{'='*50}")
+        print(f"  Preprocess (image+audio) : {preprocess_sec:6.2f}s")
+        print(f"  Encode source image      : {encode_sec:6.2f}s")
+        print(f"  Motion generation (ODE)  : {motion_gen_sec:6.2f}s")
+        print(f"  Render frames            : {render_sec:6.2f}s")
+        print(f"  Save video + mux audio   : {save_sec:6.2f}s")
+        print(f"{'─'*50}")
+        print(f"  Total                    : {total_sec:6.2f}s")
+        print(f"  Frames generated         : {num_frames}")
+        print(f"  Effective speed          : {fps_actual:6.2f} frames/sec")
+        print(f"{'='*50}\n")
+
+        return result
 
     @torch.no_grad()
     def encode_image(self, x):
