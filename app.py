@@ -94,7 +94,7 @@ class AppConfig:
         self.rank = "cuda" 
         self.sampling_rate = 16000
         self.audio_marcing = 2
-        self.wav2vec_sec = 2.0
+        self.wav2vec_sec = 4.0
         self.attention_window = 5
         self.only_last_features = True
         self.audio_dropout_prob = 0.1
@@ -318,14 +318,25 @@ class InferenceAgent:
         else:
             return raw_path
 
-    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None):
+    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.008):
+        """Build a mostly-static pose sequence with subtle micro-jitter.
+
+        Args:
+            jitter_scale: standard deviation of Gaussian noise added to the
+                resting pose.  0.008 is ~0.5-1% of typical SMIRK pose magnitude,
+                enough to avoid the uncanny-valley of perfect stillness while
+                keeping the head visually static.
+        """
         batch_size = audio_tensor.shape[0]
         seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
         device = audio_tensor.device
         dtype = audio_tensor.dtype
 
         if pose_sequence is None:
-            return torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            static = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+            if jitter_scale > 0:
+                static = static + torch.randn_like(static) * jitter_scale
+            return static
 
         pose_sequence = pose_sequence.to(device=device, dtype=dtype)
         if pose_sequence.dim() == 2:
@@ -344,7 +355,10 @@ class InferenceAgent:
             )
 
         resting_pose = pose_sequence[:, :1, :]
-        return resting_pose.expand(batch_size, seq_len, 3).clone()
+        static = resting_pose.expand(batch_size, seq_len, 3).clone()
+        if jitter_scale > 0:
+            static = static + torch.randn_like(static) * jitter_scale
+        return static
 
     @torch.no_grad()
     def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
