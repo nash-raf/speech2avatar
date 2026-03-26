@@ -223,7 +223,7 @@ class InferenceAgent:
         else:
             data["cam"] = None
 
-        data["pose"] = self._build_static_pose_sequence(data["a"], pose_sequence)
+        # data["pose"] = self._build_static_pose_sequence(data["a"], pose_sequence)
 
         if gaze_path and os.path.exists(gaze_path):
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
