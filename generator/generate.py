@@ -216,14 +216,13 @@ class InferenceAgent:
         device = data["a"].device
         dtype = data["a"].dtype
 
-        pose_sequence = None
         if pose_path and os.path.exists(pose_path):
-            pose_sequence, data["cam"] = load_smirk_params(torch.load(pose_path))
+            data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
+            data["pose"] = data["pose"].to(device=device, dtype=dtype)
             data["cam"] = data["cam"].to(device=device, dtype=dtype)
         else:
+            data["pose"] = None
             data["cam"] = None
-
-        # data["pose"] = self._build_static_pose_sequence(data["a"], pose_sequence)
 
         if gaze_path and os.path.exists(gaze_path):
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)

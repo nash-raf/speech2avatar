@@ -85,34 +85,33 @@ class FMGenerator(nn.Module):
 
         return pred[:, self.num_prev_frames:, ...]
 
-    def _prepare_condition_sequence(self, tensor, target_len, batch_size, feature_dim, device, dtype):
+    def _align_sequence(self, tensor, target_len):
         if tensor is None:
-            return torch.zeros(batch_size, target_len, feature_dim, device=device, dtype=dtype)
+            return None
 
-        tensor = tensor.to(device=device, dtype=dtype)
         if tensor.dim() == 2:
-            tensor = tensor.unsqueeze(0)
+            tensor = tensor.to(self.rank)
         elif tensor.dim() != 3:
             raise ValueError(f"Expected condition tensor with 2 or 3 dims, got shape {tuple(tensor.shape)}")
+        else:
+            tensor = tensor.to(self.rank)
 
-        if tensor.shape[-1] != feature_dim:
-            raise ValueError(
-                f"Expected condition feature dim {feature_dim}, got {tensor.shape[-1]} for shape {tuple(tensor.shape)}"
-            )
-
-        if tensor.shape[0] == 1 and batch_size > 1:
-            tensor = tensor.expand(batch_size, -1, -1)
-        elif tensor.shape[0] != batch_size:
-            raise ValueError(
-                f"Expected condition batch size {batch_size}, got {tensor.shape[0]} for shape {tuple(tensor.shape)}"
-            )
+        if tensor.dim() == 2:
+            curr_len = tensor.shape[0]
+            if curr_len > target_len:
+                return tensor[:target_len]
+            elif curr_len < target_len:
+                pad_len = target_len - curr_len
+                padding = torch.zeros(pad_len, tensor.shape[1], device=tensor.device, dtype=tensor.dtype)
+                return torch.cat([tensor, padding], dim=0)
+            return tensor
 
         curr_len = tensor.shape[1]
         if curr_len > target_len:
             tensor = tensor[:, :target_len]
         elif curr_len < target_len:
             pad_len = target_len - curr_len
-            padding = torch.zeros(batch_size, pad_len, feature_dim, device=device, dtype=dtype)
+            padding = torch.zeros(tensor.shape[0], pad_len, tensor.shape[2], device=tensor.device, dtype=tensor.dtype)
             tensor = torch.cat([tensor, padding], dim=1)
         return tensor
 
@@ -135,21 +134,25 @@ class FMGenerator(nn.Module):
         a = self.audio_encoder.inference(a, seq_len=T)
         a = self.audio_projection(a)
 
-        # Pose is explicitly controlled, while omitted cam/gaze keep IMTalker's
-        # original null-conditioning behavior.
+        # Match original IMTalker inference: if pose/cam/gaze are omitted,
+        # fall back to null conditioning instead of forcing a static pose.
         cond_dtype = a.dtype
-        pose = self._prepare_condition_sequence(pose_raw, T, B, 3, device, cond_dtype)
-        pose = self.pose_projection(pose)
+        gaze = self._align_sequence(gaze_raw, T)
+        pose = self._align_sequence(pose_raw, T)
+        cam = self._align_sequence(cam_raw, T)
 
-        if gaze_raw is not None:
-            gaze = self._prepare_condition_sequence(gaze_raw, T, B, 2, device, cond_dtype)
-            gaze = self.gaze_projection(gaze)
+        if gaze is not None:
+            gaze = self.gaze_projection(gaze.to(dtype=cond_dtype)).unsqueeze(0) if gaze.dim() == 2 else self.gaze_projection(gaze.to(dtype=cond_dtype))
         else:
             gaze = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
 
-        if cam_raw is not None:
-            cam = self._prepare_condition_sequence(cam_raw, T, B, 3, device, cond_dtype)
-            cam = self.cam_projection(cam)
+        if pose is not None:
+            pose = self.pose_projection(pose.to(dtype=cond_dtype)).unsqueeze(0) if pose.dim() == 2 else self.pose_projection(pose.to(dtype=cond_dtype))
+        else:
+            pose = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
+
+        if cam is not None:
+            cam = self.cam_projection(cam.to(dtype=cond_dtype)).unsqueeze(0) if cam.dim() == 2 else self.cam_projection(cam.to(dtype=cond_dtype))
         else:
             cam = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
 
