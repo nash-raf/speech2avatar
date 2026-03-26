@@ -295,8 +295,8 @@ class InferenceOptions(BaseOptions):
     def initialize(self, parser):
         super().initialize(parser)
         parser.add_argument("--ref_path", type=str, default=None)
-        parser.add_argument("--pose_path", type=str, default=None)
-        parser.add_argument("--gaze_path", type=str, default=None)
+        parser.add_argument("--pose_path", type=str, default=None, help="Pose .pt file or directory of per-sample .pt files")
+        parser.add_argument("--gaze_path", type=str, default=None, help="Gaze .npy file or directory of per-sample .npy files")
         parser.add_argument('--aud_path', type=str, default=None)
         parser.add_argument('--crop', action='store_true')
         parser.add_argument('--res_video_path', type=str, default=None)
@@ -307,12 +307,22 @@ class InferenceOptions(BaseOptions):
         return parser
 
 
+def resolve_condition_path(path_value, sample_name, extension):
+    if not path_value:
+        return None
+
+    if os.path.isfile(path_value):
+        return path_value
+
+    if os.path.isdir(path_value):
+        return os.path.join(path_value, f"{sample_name}{extension}")
+
+    return path_value
+
+
 def process_item(agent, ref, aud, name, opt):
-    pose_root = getattr(opt, "pose_path", None)
-    gaze_root = getattr(opt, "gaze_path", None)
-    
-    pose = os.path.join(pose_root, f"{name}.pt") if pose_root else None
-    gaze = os.path.join(gaze_root, f"{name}.npy") if gaze_root else None
+    pose = resolve_condition_path(getattr(opt, "pose_path", None), name, ".pt")
+    gaze = resolve_condition_path(getattr(opt, "gaze_path", None), name, ".npy")
     
     out_path = os.path.join(opt.res_dir, f"{name}.mp4")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
