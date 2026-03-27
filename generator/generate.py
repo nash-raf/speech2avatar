@@ -167,8 +167,8 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
-    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.008):
-        """Build a mostly-static pose sequence with subtle micro-jitter.
+    def _build_static_condition_sequence(self, audio_tensor, sequence=None, feature_dim=3, jitter_scale=0.008):
+        """Build a mostly-static conditioning sequence with subtle micro-jitter.
 
         Args:
             jitter_scale: standard deviation of Gaussian noise added to the
@@ -181,33 +181,38 @@ class InferenceAgent:
         device = audio_tensor.device
         dtype = audio_tensor.dtype
 
-        if pose_sequence is None:
-            static = torch.zeros(batch_size, seq_len, 3, device=device, dtype=dtype)
+        if sequence is None:
+            static = torch.zeros(batch_size, seq_len, feature_dim, device=device, dtype=dtype)
             if jitter_scale > 0:
                 static = static + torch.randn_like(static) * jitter_scale
             return static
 
-        pose_sequence = pose_sequence.to(device=device, dtype=dtype)
-        if pose_sequence.dim() == 2:
-            pose_sequence = pose_sequence.unsqueeze(0)
-        elif pose_sequence.dim() != 3:
-            raise ValueError(f"Expected pose sequence with 2 or 3 dims, got shape {tuple(pose_sequence.shape)}")
+        sequence = sequence.to(device=device, dtype=dtype)
+        if sequence.dim() == 2:
+            sequence = sequence.unsqueeze(0)
+        elif sequence.dim() != 3:
+            raise ValueError(f"Expected conditioning sequence with 2 or 3 dims, got shape {tuple(sequence.shape)}")
 
-        if pose_sequence.shape[-1] != 3:
-            raise ValueError(f"Expected pose feature dim 3, got {pose_sequence.shape[-1]}")
+        if sequence.shape[-1] != feature_dim:
+            raise ValueError(f"Expected conditioning feature dim {feature_dim}, got {sequence.shape[-1]}")
 
-        if pose_sequence.shape[0] == 1 and batch_size > 1:
-            pose_sequence = pose_sequence.expand(batch_size, -1, -1)
-        elif pose_sequence.shape[0] != batch_size:
+        if sequence.shape[0] == 1 and batch_size > 1:
+            sequence = sequence.expand(batch_size, -1, -1)
+        elif sequence.shape[0] != batch_size:
             raise ValueError(
-                f"Expected pose batch size {batch_size}, got {pose_sequence.shape[0]} for shape {tuple(pose_sequence.shape)}"
+                f"Expected conditioning batch size {batch_size}, got {sequence.shape[0]} for shape {tuple(sequence.shape)}"
             )
 
-        resting_pose = pose_sequence[:, :1, :]
-        static = resting_pose.expand(batch_size, seq_len, 3).clone()
+        resting = sequence[:, :1, :]
+        static = resting.expand(batch_size, seq_len, feature_dim).clone()
         if jitter_scale > 0:
             static = static + torch.randn_like(static) * jitter_scale
         return static
+
+    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.008):
+        return self._build_static_condition_sequence(
+            audio_tensor, sequence=pose_sequence, feature_dim=3, jitter_scale=jitter_scale
+        )
 
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
@@ -230,8 +235,8 @@ class InferenceAgent:
             data["pose"] = None
             data["cam"] = None
 
-        data["pose"] = self._build_static_pose_sequence(data["a"], data["pose"])
-        data["cam"] = None
+        data["pose"] = self._build_static_condition_sequence(data["a"], data["pose"], feature_dim=3)
+        data["cam"] = self._build_static_condition_sequence(data["a"], data["cam"], feature_dim=3)
 
         if gaze_path and os.path.exists(gaze_path):
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
