@@ -256,6 +256,7 @@ class FlowMatchingTransformer(nn.Module):
         dropout_prob: float,
         train: bool = False
     ) -> torch.Tensor:
+        sequence = sequence.clone()
         if train:
             batch_id_for_drop = torch.where(
                 torch.rand(sequence.shape[0], device=sequence.device) < dropout_prob
@@ -277,6 +278,8 @@ class FlowMatchingTransformer(nn.Module):
         prev_pose,
         cam,
         prev_cam,
+        au,
+        prev_au,
         train: bool = True,
         **kwargs
     ) -> torch.Tensor:
@@ -285,6 +288,7 @@ class FlowMatchingTransformer(nn.Module):
         pose = self.sequence_embedder(pose, dropout_prob=self.opt.audio_dropout_prob, train=train)
         cam  = self.sequence_embedder(cam,  dropout_prob=self.opt.audio_dropout_prob, train=train)
         gaze = self.sequence_embedder(gaze, dropout_prob=self.opt.audio_dropout_prob, train=train)
+        au   = self.sequence_embedder(au,   dropout_prob=self.opt.au_dropout_prob, train=train)
 
         if prev_x is not None:
             prev_x    = self.sequence_embedder(prev_x,    dropout_prob=0.5, train=train)
@@ -292,12 +296,14 @@ class FlowMatchingTransformer(nn.Module):
             prev_pose = self.sequence_embedder(prev_pose, dropout_prob=0.5, train=train)
             prev_cam  = self.sequence_embedder(prev_cam,  dropout_prob=0.5, train=train)
             prev_gaze = self.sequence_embedder(prev_gaze, dropout_prob=0.5, train=train)
+            prev_au   = self.sequence_embedder(prev_au,   dropout_prob=0.5, train=train)
 
             x    = torch.cat([prev_x, x], dim=1)
             a    = torch.cat([prev_a, a], dim=1)
             pose = torch.cat([prev_pose, pose], dim=1)
             cam  = torch.cat([prev_cam, cam], dim=1)
             gaze = torch.cat([prev_gaze, gaze], dim=1)
+            au   = torch.cat([prev_au, au], dim=1)
 
         ref_x = ref_x[:, None, ...].repeat(1, x.shape[1], 1)
         x     = torch.cat([ref_x, x], dim=-1)
@@ -306,7 +312,7 @@ class FlowMatchingTransformer(nn.Module):
         # Calculate RoPE
         rotary_pos_emb = self.rotary_emb(x, seq_len=x.shape[1])
 
-        c = self.c_embedder(a + pose + cam + gaze)
+        c = self.c_embedder(a + pose + cam + gaze + au)
         c = t + c
 
         for block in self.blocks:
@@ -329,6 +335,8 @@ class FlowMatchingTransformer(nn.Module):
         prev_pose,
         cam,
         prev_cam,
+        au,
+        prev_au,
         a_cfg_scale: float = 1.0,
         **kwargs
     ) -> torch.Tensor:
@@ -338,6 +346,7 @@ class FlowMatchingTransformer(nn.Module):
             gaze_cat      = torch.cat([gaze, gaze], dim=0)
             pose_cat      = torch.cat([pose, pose], dim=0)
             cam_cat       = torch.cat([cam,  cam],  dim=0)
+            au_cat        = torch.cat([au, au], dim=0)
 
             x_cat         = torch.cat([x, x], dim=0)
             prev_x_cat    = torch.cat([prev_x, prev_x], dim=0)
@@ -345,6 +354,7 @@ class FlowMatchingTransformer(nn.Module):
             prev_gaze_cat = torch.cat([prev_gaze, prev_gaze], dim=0)
             prev_pose_cat = torch.cat([prev_pose, prev_pose], dim=0)
             prev_cam_cat  = torch.cat([prev_cam, prev_cam], dim=0)
+            prev_au_cat   = torch.cat([prev_au, prev_au], dim=0)
             ref_x_cat     = torch.cat([ref_x, ref_x], dim=0)
 
             model_output = self.forward(
@@ -360,6 +370,8 @@ class FlowMatchingTransformer(nn.Module):
                 prev_pose=prev_pose_cat,
                 cam=cam_cat,
                 prev_cam=prev_cam_cat,
+                au=au_cat,
+                prev_au=prev_au_cat,
                 train=False
             )
             uncond, all_cond = torch.chunk(model_output, chunks=2, dim=0)
@@ -379,5 +391,7 @@ class FlowMatchingTransformer(nn.Module):
                 prev_pose=prev_pose,
                 cam=cam,
                 prev_cam=prev_cam,
+                au=au,
+                prev_au=prev_au,
                 train=False
             )

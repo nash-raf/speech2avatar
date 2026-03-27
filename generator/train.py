@@ -1,16 +1,22 @@
 import os
 import time
+import sys
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch import pi
 from torch.nn import Module
 from torch.utils import data
-from torch import nn, optim
-from einops import rearrange, repeat
+from torch import optim
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from generator.dataset import AudioMotionSmirkGazeDataset
-from FM import FMGenerator
-from options.base_options import BaseOptions
+from generator.FM import FMGenerator
+from generator.options.base_options import BaseOptions
 from pytorch_lightning.loggers import TensorBoardLogger
 
 # ==========================================
@@ -68,6 +74,7 @@ class System(pl.LightningModule):
         self.model = FMGenerator(opt)
         self.opt = opt
         self.loss_fn = L1loss()
+        self._apply_finetune_freeze()
         
         self.ema = EMA(self.model, decay=0.9999) 
 
@@ -90,7 +97,28 @@ class System(pl.LightningModule):
         if "ema_state_dict" in checkpoint:
             self.ema.shadow = checkpoint["ema_state_dict"]
 
+    def _prepare_batch(self, batch):
+        alias_pairs = [
+            ("gaze", "gaze_now"),
+            ("pose", "pose_now"),
+            ("cam", "cam_now"),
+            ("au", "au_now"),
+        ]
+        for canonical_key, alias_key in alias_pairs:
+            if canonical_key not in batch and alias_key in batch:
+                batch[canonical_key] = batch[alias_key]
+        return batch
+
+    def _apply_finetune_freeze(self):
+        freeze_n = max(0, min(self.opt.freeze_first_n_blocks, len(self.model.fmt.blocks)))
+        for block in self.model.fmt.blocks[:freeze_n]:
+            for param in block.parameters():
+                param.requires_grad = False
+        if freeze_n:
+            print(f"[INFO] Froze first {freeze_n} FMT blocks for AU fine-tuning.")
+
     def training_step(self, batch, batch_idx):
+        batch = self._prepare_batch(batch)
         m_now = batch["m_now"]
 
         noise = torch.randn_like(m_now)
@@ -115,6 +143,7 @@ class System(pl.LightningModule):
         return train_loss
 
     def validation_step(self, batch, batch_idx):
+        batch = self._prepare_batch(batch)
         m_now = batch["m_now"]
         noise = torch.randn_like(m_now); times = torch.rand(m_now.size(0), device=self.device); t = append_dims(times, m_now.ndim - 1)
         noised_motion = t * m_now + (1 - t) * noise; gt_flow = m_now - noise
@@ -166,8 +195,31 @@ class System(pl.LightningModule):
             print(f"[WARNING] {len(unmatched_keys)} keys skipped.")
 
     def configure_optimizers(self):
-        opt = optim.Adam(self.model.parameters(), lr=self.opt.lr, betas=(0.5, 0.999))
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.opt.iter, eta_min=1e-5)
+        full_lr_params = list(self.model.au_projection.parameters())
+        full_lr_ids = {id(param) for param in full_lr_params}
+
+        reduced_modules = [
+            self.model.audio_projection,
+            self.model.gaze_projection,
+            self.model.pose_projection,
+            self.model.cam_projection,
+            self.model.fmt,
+        ]
+        reduced_lr_params = []
+        for module in reduced_modules:
+            for param in module.parameters():
+                if not param.requires_grad or id(param) in full_lr_ids:
+                    continue
+                reduced_lr_params.append(param)
+
+        param_groups = []
+        if full_lr_params:
+            param_groups.append({"params": full_lr_params, "lr": self.opt.lr})
+        if reduced_lr_params:
+            param_groups.append({"params": reduced_lr_params, "lr": self.opt.lr * 0.1})
+
+        opt = optim.Adam(param_groups, betas=(0.5, 0.999))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.opt.iter, eta_min=self.opt.lr * 0.01)
         return {"optimizer": opt, "lr_scheduler": scheduler}
     
 class TrainOptions(BaseOptions):
@@ -176,7 +228,7 @@ class TrainOptions(BaseOptions):
 
     def initialize(self, parser):
         parser = super().initialize(parser)
-        parser.add_argument("--dataset_pat", default=None, type=str)
+        parser.add_argument("--dataset_path", default=None, type=str)
         parser.add_argument('--lr', default=1e-4, type=float)
         parser.add_argument('--batch_size', default=16, type=int)
         parser.add_argument('--iter', default=5000000, type=int)

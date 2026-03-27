@@ -1,11 +1,13 @@
 import math
 import os
+import sys
 import time
 import datetime
 import random
 import tempfile
 import subprocess
 import argparse
+from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
@@ -18,9 +20,13 @@ from PIL import Image
 import torchvision.transforms as transforms
 from transformers import Wav2Vec2FeatureExtractor
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from generator.FM import FMGenerator
 from renderer.models import IMTRenderer
-from options.base_options import BaseOptions
+from generator.options.base_options import BaseOptions
 
 
 def load_smirk_params(smirk_data):
@@ -228,6 +234,12 @@ class InferenceAgent:
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
         else:
             data["gaze"] = None
+
+        au_path = kwargs.get("au_path")
+        if au_path and os.path.exists(au_path):
+            data["au"] = torch.tensor(np.load(au_path), dtype=dtype, device=device)
+        else:
+            data["au"] = None
         preprocess_sec = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -296,6 +308,7 @@ class InferenceOptions(BaseOptions):
         parser.add_argument("--ref_path", type=str, default=None)
         parser.add_argument("--pose_path", type=str, default=None, help="Pose .pt file or directory of per-sample .pt files")
         parser.add_argument("--gaze_path", type=str, default=None, help="Gaze .npy file or directory of per-sample .npy files")
+        parser.add_argument("--au_path", type=str, default=None, help="AU .npy file or directory of per-sample .npy files")
         parser.add_argument('--aud_path', type=str, default=None)
         parser.add_argument('--crop', action='store_true')
         parser.add_argument('--res_video_path', type=str, default=None)
@@ -322,6 +335,7 @@ def resolve_condition_path(path_value, sample_name, extension):
 def process_item(agent, ref, aud, name, opt):
     pose = resolve_condition_path(getattr(opt, "pose_path", None), name, ".pt")
     gaze = resolve_condition_path(getattr(opt, "gaze_path", None), name, ".npy")
+    au = resolve_condition_path(getattr(opt, "au_path", None), name, ".npy")
     
     out_path = os.path.join(opt.res_dir, f"{name}.mp4")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -330,7 +344,7 @@ def process_item(agent, ref, aud, name, opt):
     try:
         agent.run_inference(
             out_path, ref, aud, pose, gaze,
-            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed
+            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed, au_path=au
         )
     except Exception as e:
         print(f"Error processing {name}: {e}")

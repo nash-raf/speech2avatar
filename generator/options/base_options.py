@@ -31,6 +31,7 @@ class BaseOptions():
 		parser.add_argument('--audio_dropout_prob', default=0.1, type=float)
 		parser.add_argument('--ref_dropout_prob', default=0.1, type=float)
 		parser.add_argument('--emotion_dropout_prob', default=0.1, type=float)
+		parser.add_argument('--au_dropout_prob', default=0.1, type=float)
 
 		# model Hyper Parameters
 		parser.add_argument('--style_dim', type=int, default=512, help='w latent dimension')
@@ -40,6 +41,7 @@ class BaseOptions():
 		parser.add_argument("--dim_motion", type=int, default=32)
 		parser.add_argument("--dim_c", type=int, default=32)
 		parser.add_argument('--dim_w', type=int, default=32, help='face dimension')
+		parser.add_argument('--num_aus', default=17, type=int, help='number of AU conditioning channels')
 
 		# option for FMT
 		parser.add_argument('--fmt_depth', default=8, type=int)
@@ -48,6 +50,8 @@ class BaseOptions():
 		parser.add_argument('--no_learned_pe', action='store_true')
 		parser.add_argument('--num_prev_frames', type=int, default=10)
 		parser.add_argument('--max_grad_norm', default=1, type=float, help='max grad norm for training transformers')
+		parser.add_argument('--static_pose_aug_prob', default=0.3, type=float)
+		parser.add_argument('--freeze_first_n_blocks', default=4, type=int)
 
 		parser.add_argument('--ode_atol', default=1e-5, type=float)
 		parser.add_argument('--ode_rtol', default=1e-5, type=float)
@@ -91,4 +95,3 @@ def load_options(opt, load_path):
 		_update = json.loads(f)
 	opt.update(_update)
 	return opt
-

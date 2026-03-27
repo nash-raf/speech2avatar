@@ -30,6 +30,7 @@ class FMGenerator(nn.Module):
         self.gaze_projection = self._make_projection(2, opt.dim_c)
         self.pose_projection = self._make_projection(3, opt.dim_c)
         self.cam_projection = self._make_projection(3, opt.dim_c)
+        self.au_projection = self._make_projection(opt.num_aus, opt.dim_c)
 
         self.odeint_kwargs = {
             'atol': opt.ode_atol,
@@ -56,9 +57,15 @@ class FMGenerator(nn.Module):
         a, prev_a = batch["a_now"], batch["a_prev"]
         m_ref = batch["m_ref"]
         
-        gaze, prev_gaze = batch["gaze"], batch["gaze_prev"]
-        pose, prev_pose = batch["pose"], batch["pose_prev"]
-        cam, prev_cam = batch["cam"], batch["cam_prev"]
+        gaze = batch.get("gaze", batch.get("gaze_now"))
+        pose = batch.get("pose", batch.get("pose_now"))
+        cam = batch.get("cam", batch.get("cam_now"))
+        au = batch.get("au", batch.get("au_now"))
+
+        prev_gaze = batch["gaze_prev"]
+        prev_pose = batch["pose_prev"]
+        prev_cam = batch["cam_prev"]
+        prev_au = batch["au_prev"]
 
         bs = x.size(0)
 
@@ -75,12 +82,15 @@ class FMGenerator(nn.Module):
         prev_pose = self.pose_projection(prev_pose)
         cam = self.cam_projection(cam)
         prev_cam = self.cam_projection(prev_cam)
+        au = self.au_projection(au)
+        prev_au = self.au_projection(prev_au)
 
         pred = self.fmt(
-            t, x.squeeze(), a, prev_x, prev_a, m_ref,
+            t, x, a, prev_x, prev_a, m_ref,
             gaze=gaze, prev_gaze=prev_gaze,
             pose=pose, prev_pose=prev_pose,
-            cam=cam, prev_cam=prev_cam
+            cam=cam, prev_cam=prev_cam,
+            au=au, prev_au=prev_au,
         )
 
         return pred[:, self.num_prev_frames:, ...]
@@ -121,6 +131,7 @@ class FMGenerator(nn.Module):
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
         cam_raw = data.get('cam')
+        au_raw = data.get('au')
         
         B = a.shape[0]
         device = self.rank
@@ -140,6 +151,7 @@ class FMGenerator(nn.Module):
         gaze = self._align_sequence(gaze_raw, T)
         pose = self._align_sequence(pose_raw, T)
         cam = self._align_sequence(cam_raw, T)
+        au = self._align_sequence(au_raw, T)
 
         if gaze is not None:
             gaze = self.gaze_projection(gaze.to(dtype=cond_dtype)).unsqueeze(0) if gaze.dim() == 2 else self.gaze_projection(gaze.to(dtype=cond_dtype))
@@ -155,6 +167,11 @@ class FMGenerator(nn.Module):
             cam = self.cam_projection(cam.to(dtype=cond_dtype)).unsqueeze(0) if cam.dim() == 2 else self.cam_projection(cam.to(dtype=cond_dtype))
         else:
             cam = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
+
+        if au is not None:
+            au = self.au_projection(au.to(dtype=cond_dtype)).unsqueeze(0) if au.dim() == 2 else self.au_projection(au.to(dtype=cond_dtype))
+        else:
+            au = torch.zeros(B, T, self.opt.dim_c, device=device, dtype=cond_dtype)
 
         # Generation Loop
         sample = []
@@ -177,12 +194,14 @@ class FMGenerator(nn.Module):
                 prev_gaze_t = torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
                 prev_pose_t = torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
                 prev_cam_t = torch.zeros(B, self.num_prev_frames, cam.shape[-1], device=device)
+                prev_au_t = torch.zeros(B, self.num_prev_frames, au.shape[-1], device=device)
             else:
                 prev_x_t = sample_t[:, -self.num_prev_frames:]
                 prev_a_t = a_t[:, -self.num_prev_frames:]
                 prev_gaze_t = gaze_t[:, -self.num_prev_frames:]
                 prev_pose_t = pose_t[:, -self.num_prev_frames:]
                 prev_cam_t = cam_t[:, -self.num_prev_frames:]
+                prev_au_t = au_t[:, -self.num_prev_frames:]
 
             # Slice Current Window
             start_idx = t * self.num_frames_for_clip
@@ -192,6 +211,7 @@ class FMGenerator(nn.Module):
             gaze_t = gaze[:, start_idx:end_idx]
             pose_t = pose[:, start_idx:end_idx]
             cam_t = cam[:, start_idx:end_idx]
+            au_t = au[:, start_idx:end_idx]
 
             # Pad last chunk if necessary
             current_chunk_len = a_t.shape[1]
@@ -206,6 +226,7 @@ class FMGenerator(nn.Module):
                 gaze_t = pad_tensor(gaze_t)
                 pose_t = pad_tensor(pose_t)
                 cam_t = pad_tensor(cam_t)
+                au_t = pad_tensor(au_t)
 
             # ODE Solver Function
             def sample_chunk(tt, zt):
@@ -219,6 +240,7 @@ class FMGenerator(nn.Module):
                     gaze=gaze_t, prev_gaze=prev_gaze_t,
                     pose=pose_t, prev_pose=prev_pose_t,
                     cam=cam_t, prev_cam=prev_cam_t,
+                    au=au_t, prev_au=prev_au_t,
                     a_cfg_scale=a_cfg_scale,
                 )
                 return out[:, self.num_prev_frames:]

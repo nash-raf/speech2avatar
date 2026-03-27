@@ -4,7 +4,6 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
 
 def load_pose(smirk):
     pose = smirk["pose_params"]  # (N, 3)
@@ -25,6 +24,8 @@ class AudioMotionSmirkGazeDataset(Dataset):
         audio_dir = root_path / "audio"
         smirk_dir = root_path / "smirk"
         gaze_dir = root_path / "gaze"
+        au_dir = root_path / "au"
+        self.au_dir_exists = au_dir.exists()
 
         # Get all motion files as anchor, sorted to ensure deterministic split
         motion_files = sorted(list(motion_dir.glob("*.pt")))
@@ -41,6 +42,7 @@ class AudioMotionSmirkGazeDataset(Dataset):
             audio_path = audio_dir / f"{file_stem}.npy"
             gaze_path = gaze_dir / f"{file_stem}.npy"
             smirk_path = smirk_dir / f"{file_stem}.pt"
+            au_path = au_dir / f"{file_stem}.npy"
 
             if not (audio_path.exists() and gaze_path.exists() and smirk_path.exists()):
                 continue
@@ -55,20 +57,26 @@ class AudioMotionSmirkGazeDataset(Dataset):
                 # Use mmap_mode='r' for faster length checking of numpy files
                 audio = np.load(audio_path, mmap_mode='r')
                 gaze = np.load(gaze_path, mmap_mode='r')
+                au = np.load(au_path, mmap_mode='r') if au_path.exists() else None
                 
                 motion_len = len(motion)
                 audio_len = len(audio)
                 gaze_len = len(gaze)
                 smirk_len = len(smirk["pose_params"]) 
+                au_len = len(au) if au is not None else None
                 
-                min_len = min(motion_len, audio_len, gaze_len, smirk_len)
+                lengths = [motion_len, audio_len, gaze_len, smirk_len]
+                if au_len is not None:
+                    lengths.append(au_len)
+                min_len = min(lengths)
 
                 if min_len >= self.required_len:
                     self.samples.append({
                         "motion_path": str(motion_path),
                         "audio_path": str(audio_path),
                         "smirk_path": str(smirk_path),
-                        "gaze_path": str(gaze_path)
+                        "gaze_path": str(gaze_path),
+                        "au_path": str(au_path),
                     })
             except Exception as e:
                 print(f"[Warning] Error checking file {file_stem}: {e}")
@@ -88,9 +96,14 @@ class AudioMotionSmirkGazeDataset(Dataset):
         audio = np.load(item['audio_path'], mmap_mode='r')
         gaze = np.load(item['gaze_path'], mmap_mode='r')
         smirk = torch.load(item['smirk_path'])
+        au_path = Path(item["au_path"])
+        au = np.load(au_path, mmap_mode='r') if au_path.exists() else None
         pose, cam = load_pose(smirk)
 
-        min_len = min(len(motion), len(audio), len(gaze), len(pose))
+        lengths = [len(motion), len(audio), len(gaze), len(pose)]
+        if au is not None:
+            lengths.append(len(au))
+        min_len = min(lengths)
         start_idx = random.randint(0, min_len - self.required_len)
         end_idx = start_idx + self.required_len
 
@@ -99,26 +112,38 @@ class AudioMotionSmirkGazeDataset(Dataset):
         gaze_seg = torch.from_numpy(gaze[start_idx:end_idx].copy()).float()
         pose_seg = pose[start_idx:end_idx]
         cam_seg = cam[start_idx:end_idx]
+        if au is not None:
+            au_seg = torch.from_numpy(au[start_idx:end_idx].copy()).float()
+        else:
+            au_seg = torch.zeros(self.required_len, self.opt.num_aus, dtype=torch.float32)
+
+        if random.random() < self.opt.static_pose_aug_prob:
+            pose_seg = pose_seg[:1].repeat(self.required_len, 1)
+            cam_seg = cam_seg[:1].repeat(self.required_len, 1)
 
         motion_prev = motion_seg[:self.num_prev_frames]
         audio_prev = audio_seg[:self.num_prev_frames]
         gaze_prev = gaze_seg[:self.num_prev_frames]
         pose_prev = pose_seg[:self.num_prev_frames]
         cam_prev = cam_seg[:self.num_prev_frames]
+        au_prev = au_seg[:self.num_prev_frames]
 
         motion_clip = motion_seg[self.num_prev_frames:]
         audio_clip = audio_seg[self.num_prev_frames:]
         gaze_clip = gaze_seg[self.num_prev_frames:]
         pose_clip = pose_seg[self.num_prev_frames:]
         cam_clip = cam_seg[self.num_prev_frames:]
+        au_clip = au_seg[self.num_prev_frames:]
 
         return (motion_clip, audio_clip, motion_prev, audio_prev, motion_seg, 
-                gaze_clip, gaze_prev, pose_clip, pose_prev, cam_clip, cam_prev)
+                gaze_clip, gaze_prev, pose_clip, pose_prev, cam_clip, cam_prev,
+                au_clip, au_prev)
 
     def __getitem__(self, index):
         try:
             (motion_clip, audio_clip, motion_prev, audio_prev, motion_seg, 
-             gaze_clip, gaze_prev, pose_clip, pose_prev, cam_clip, cam_prev) = self._get_full_clip(index)
+             gaze_clip, gaze_prev, pose_clip, pose_prev, cam_clip, cam_prev,
+             au_clip, au_prev) = self._get_full_clip(index)
         except Exception as e:
             print(f"[Error] Failed to get clip for index {index}: {e}. Trying a random sample.")
             return self.__getitem__(random.randint(0, len(self) - 1))
@@ -129,6 +154,9 @@ class AudioMotionSmirkGazeDataset(Dataset):
         return {
             "m_now": motion_clip,
             "a_now": audio_clip,
+            "gaze": gaze_clip,
+            "pose": pose_clip,
+            "cam": cam_clip,
             "gaze_now": gaze_clip,
             "pose_now": pose_clip,
             "cam_now": cam_clip,
@@ -137,5 +165,8 @@ class AudioMotionSmirkGazeDataset(Dataset):
             "gaze_prev": gaze_prev,
             "pose_prev": pose_prev,
             "cam_prev": cam_prev,
+            "au": au_clip,
+            "au_now": au_clip,
+            "au_prev": au_prev,
             "m_ref": m_ref,
         }
