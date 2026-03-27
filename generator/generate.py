@@ -167,14 +167,13 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
-    def _build_static_condition_sequence(self, audio_tensor, sequence=None, feature_dim=3, jitter_scale=0.008):
-        """Build a mostly-static conditioning sequence with subtle micro-jitter.
+    def _build_static_condition_sequence(self, audio_tensor, sequence=None, feature_dim=3, jitter_scale=0.0):
+        """Build a static conditioning sequence.
 
         Args:
             jitter_scale: standard deviation of Gaussian noise added to the
-                resting pose.  0.008 is ~0.5-1% of typical SMIRK pose magnitude,
-                enough to avoid the uncanny-valley of perfect stillness while
-                keeping the head visually static.
+                repeated resting condition. Defaults to 0 for perfectly static
+                conditioning.
         """
         batch_size = audio_tensor.shape[0]
         seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
@@ -209,7 +208,7 @@ class InferenceAgent:
             static = static + torch.randn_like(static) * jitter_scale
         return static
 
-    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.008):
+    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.0):
         return self._build_static_condition_sequence(
             audio_tensor, sequence=pose_sequence, feature_dim=3, jitter_scale=jitter_scale
         )
@@ -235,8 +234,8 @@ class InferenceAgent:
             data["pose"] = None
             data["cam"] = None
 
-        data["pose"] = self._build_static_condition_sequence(data["a"], data["pose"], feature_dim=3)
-        data["cam"] = self._build_static_condition_sequence(data["a"], data["cam"], feature_dim=3)
+        data["pose"] = self._build_static_condition_sequence(data["a"], data["pose"], feature_dim=3, jitter_scale=0.0)
+        data["cam"] = None
 
         if gaze_path and os.path.exists(gaze_path):
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
