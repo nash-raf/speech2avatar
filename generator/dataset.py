@@ -76,7 +76,7 @@ class AudioMotionSmirkGazeDataset(Dataset):
                         "audio_path": str(audio_path),
                         "smirk_path": str(smirk_path),
                         "gaze_path": str(gaze_path),
-                        "au_path": str(au_path),
+                        "au_path": str(au_path) if au_path.exists() else None,
                     })
             except Exception as e:
                 print(f"[Warning] Error checking file {file_stem}: {e}")
@@ -96,8 +96,8 @@ class AudioMotionSmirkGazeDataset(Dataset):
         audio = np.load(item['audio_path'], mmap_mode='r')
         gaze = np.load(item['gaze_path'], mmap_mode='r')
         smirk = torch.load(item['smirk_path'])
-        au_path = Path(item["au_path"])
-        au = np.load(au_path, mmap_mode='r') if au_path.exists() else None
+        au_path = Path(item["au_path"]) if item["au_path"] is not None else None
+        au = np.load(au_path, mmap_mode='r') if au_path is not None and au_path.exists() else None
         pose, cam = load_pose(smirk)
 
         lengths = [len(motion), len(audio), len(gaze), len(pose)]

@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 import sys
@@ -229,6 +230,7 @@ class TrainOptions(BaseOptions):
     def initialize(self, parser):
         parser = super().initialize(parser)
         parser.add_argument("--dataset_path", default=None, type=str)
+        parser.add_argument("--dataset_pat", dest="dataset_path", default=None, type=str, help=argparse.SUPPRESS)
         parser.add_argument('--lr', default=1e-4, type=float)
         parser.add_argument('--batch_size', default=16, type=int)
         parser.add_argument('--iter', default=5000000, type=int)

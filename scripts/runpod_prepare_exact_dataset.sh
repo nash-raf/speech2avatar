@@ -72,6 +72,18 @@ if ! find "${MEAD_DIR}" -type f -name '*.mp4' | head -n 1 >/dev/null 2>&1; then
   unzip -q "${MEAD_ZIP}" -d "${MEAD_DIR}"
 fi
 
+if [[ ! -d "${MEAD_DIR}/train" && -d "${MEAD_DIR}/MEAD/train" ]]; then
+  shopt -s dotglob nullglob
+  mv "${MEAD_DIR}/MEAD/"* "${MEAD_DIR}/"
+  rmdir "${MEAD_DIR}/MEAD"
+  shopt -u dotglob nullglob
+fi
+
+if [[ ! -d "${MEAD_DIR}/train" ]]; then
+  echo "Expected ${MEAD_DIR}/train after unzip, but it was not found." >&2
+  exit 1
+fi
+
 download_if_missing() {
   local url="$1"
   local dest="$2"

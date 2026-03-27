@@ -11,4 +11,16 @@ source preprocess/bin/activate
 mkdir -p "${MEAD_DIR}"
 unzip -q "${MEAD_ZIP}" -d "${MEAD_DIR}"
 
+if [[ ! -d "${MEAD_DIR}/train" && -d "${MEAD_DIR}/MEAD/train" ]]; then
+  shopt -s dotglob nullglob
+  mv "${MEAD_DIR}/MEAD/"* "${MEAD_DIR}/"
+  rmdir "${MEAD_DIR}/MEAD"
+  shopt -u dotglob nullglob
+fi
+
+if [[ ! -d "${MEAD_DIR}/train" ]]; then
+  echo "Expected ${MEAD_DIR}/train after unzip, but it was not found." >&2
+  exit 1
+fi
+
 echo "Unpacked MEAD into ${MEAD_DIR}"
