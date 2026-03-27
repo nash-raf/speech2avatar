@@ -243,6 +243,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--display_freq", type=int, default=10000)
         parser.add_argument("--resume_ckpt", type=str, default=None)
         parser.add_argument("--rank", type=str, default="cuda")
+        parser.add_argument("--num_workers", type=int, default=32, help="DataLoader worker processes for train set")
         
         return parser
 
@@ -272,12 +273,14 @@ class DataModule(pl.LightningDataModule):
         self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=-100, end=-1)
 
     def train_dataloader(self):
-        return data.DataLoader(self.train_dataset, num_workers=8, batch_size=self.opt.batch_size, shuffle=True)
+        return data.DataLoader(self.train_dataset, num_workers=self.opt.num_workers, batch_size=self.opt.batch_size, shuffle=True, pin_memory=True, persistent_workers=True)
 
     def val_dataloader(self):
-        return data.DataLoader(self.val_dataset, num_workers=0, batch_size=8, shuffle=False)
+        val_workers = max(1, self.opt.num_workers // 4)
+        return data.DataLoader(self.val_dataset, num_workers=val_workers, batch_size=8, shuffle=False, pin_memory=True, persistent_workers=True)
 
 if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
     opt = TrainOptions().parse()
     system = System(opt)
     dm = DataModule(opt)

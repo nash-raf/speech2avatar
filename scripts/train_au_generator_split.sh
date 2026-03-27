@@ -12,4 +12,4 @@ python generator/train.py \
     --static_pose_aug_prob 1.0 \
     --freeze_first_n_blocks 4 \
     --save_freq 10000 \
-    --display_freq 5000
+    --display_freq 7500
