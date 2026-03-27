@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 from pathlib import Path
@@ -30,6 +31,14 @@ def build_stem_index(mead_root: Path) -> dict[str, str]:
     return stem_to_split
 
 
+def load_stem_index_from_manifest(manifest_path: Path) -> dict[str, str]:
+    payload = json.loads(manifest_path.read_text())
+    stem_to_split = payload.get("stem_to_split", {})
+    if not stem_to_split:
+        raise RuntimeError(f"No split mapping found in manifest: {manifest_path}")
+    return {str(stem): str(split) for stem, split in stem_to_split.items()}
+
+
 def materialize(src: Path, dst: Path, mode: str) -> None:
     if dst.exists() or dst.is_symlink():
         dst.unlink()
@@ -49,7 +58,13 @@ def materialize(src: Path, dst: Path, mode: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--flat_root", required=True, type=Path, help="Flat generator dataset root")
-    parser.add_argument("--mead_root", required=True, type=Path, help="MEAD root with train/val/test")
+    parser.add_argument("--mead_root", default=None, type=Path, help="MEAD root with train/val/test")
+    parser.add_argument(
+        "--split_manifest",
+        default=None,
+        type=Path,
+        help="JSON manifest mapping file stem to split, used instead of scanning MEAD",
+    )
     parser.add_argument("--output_root", required=True, type=Path, help="Split-preserving output dataset root")
     parser.add_argument(
         "--mode",
@@ -62,7 +77,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    stem_to_split = build_stem_index(args.mead_root)
+    if args.split_manifest is not None:
+        stem_to_split = load_stem_index_from_manifest(args.split_manifest)
+    elif args.mead_root is not None:
+        stem_to_split = build_stem_index(args.mead_root)
+    else:
+        raise RuntimeError("Provide either --mead_root or --split_manifest")
 
     for split in SPLITS:
         for modality in MODALITIES:
