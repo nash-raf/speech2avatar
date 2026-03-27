@@ -231,6 +231,9 @@ class TrainOptions(BaseOptions):
         parser = super().initialize(parser)
         parser.add_argument("--dataset_path", default=None, type=str)
         parser.add_argument("--dataset_pat", dest="dataset_path", default=None, type=str, help=argparse.SUPPRESS)
+        parser.add_argument("--train_dataset_path", default=None, type=str)
+        parser.add_argument("--val_dataset_path", default=None, type=str)
+        parser.add_argument("--test_dataset_path", default=None, type=str, help=argparse.SUPPRESS)
         parser.add_argument('--lr', default=1e-4, type=float)
         parser.add_argument('--batch_size', default=16, type=int)
         parser.add_argument('--iter', default=5000000, type=int)
@@ -249,6 +252,22 @@ class DataModule(pl.LightningDataModule):
         self.opt = opt
 
     def setup(self, stage):
+        if self.opt.train_dataset_path and self.opt.val_dataset_path:
+            print(
+                f"[INFO] Using explicit split datasets: "
+                f"train={self.opt.train_dataset_path} val={self.opt.val_dataset_path}"
+            )
+            self.train_dataset = AudioMotionSmirkGazeDataset(
+                opt=self.opt,
+                dataset_path=self.opt.train_dataset_path,
+            )
+            self.val_dataset = AudioMotionSmirkGazeDataset(
+                opt=self.opt,
+                dataset_path=self.opt.val_dataset_path,
+            )
+            return
+
+        print("[INFO] Using legacy flat dataset split: train=all-but-last-100 val=last-99")
         self.train_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=-100)
         self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=-100, end=-1)
 

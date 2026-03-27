@@ -11,7 +11,7 @@ def load_pose(smirk):
     return pose, cam
 
 class AudioMotionSmirkGazeDataset(Dataset):
-    def __init__(self, opt, start, end):
+    def __init__(self, opt, start=None, end=None, dataset_path=None):
         super().__init__()
         self.opt = opt
         self.num_frames_for_clip = int(self.opt.wav2vec_sec * self.opt.fps)
@@ -19,7 +19,9 @@ class AudioMotionSmirkGazeDataset(Dataset):
         self.required_len = self.num_frames_for_clip + self.num_prev_frames
         
         # Define subdirectories
-        root_path = Path(opt.dataset_path)
+        root_path = Path(dataset_path or opt.dataset_path)
+        if not root_path.exists():
+            raise RuntimeError(f"Dataset path does not exist: {root_path}")
         motion_dir = root_path / "motion"
         audio_dir = root_path / "audio"
         smirk_dir = root_path / "smirk"
@@ -30,8 +32,9 @@ class AudioMotionSmirkGazeDataset(Dataset):
         # Get all motion files as anchor, sorted to ensure deterministic split
         motion_files = sorted(list(motion_dir.glob("*.pt")))
         
-        # Apply split (start:end)
-        motion_files = motion_files[start:end]
+        # Apply split (start:end) when using a flat dataset layout.
+        if start is not None or end is not None:
+            motion_files = motion_files[start:end]
 
         self.samples = []
         for motion_path in tqdm(motion_files, desc="Filtering valid samples"):
