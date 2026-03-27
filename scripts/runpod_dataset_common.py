@@ -10,10 +10,8 @@ from pathlib import Path
 import cv2
 import librosa
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
-from skimage.transform import estimate_transform, warp
 from tqdm import tqdm
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 
@@ -57,10 +55,6 @@ sys.path.insert(0, str(OPENFACE3_DIR))
 
 from renderer.models import IMTRenderer
 from generator.options.base_options import BaseOptions
-from src.smirk_encoder import SmirkEncoder
-from utils.mediapipe_utils import run_mediapipe
-from l2cs.utils import getArch, prep_input_numpy
-from model.MLT import MLT
 
 DEVICE = torch.device(f"cuda:{ARGS.gpu_id}" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
@@ -116,6 +110,9 @@ def read_frames(video_path: Path):
 
 
 def crop_face(frame_bgr):
+    from skimage.transform import estimate_transform, warp
+    from utils.mediapipe_utils import run_mediapipe
+
     kpts = run_mediapipe(frame_bgr)
     if kpts is None:
         return cv2.resize(frame_bgr, (224, 224))
@@ -170,6 +167,8 @@ def make_audio():
 
 
 def make_smirk():
+    from src.smirk_encoder import SmirkEncoder
+
     model = SmirkEncoder().to(DEVICE).eval()
     checkpoint = torch.load(MODEL_DIR / "SMIRK_em1.pt", map_location="cpu")
     checkpoint_encoder = {k.replace("smirk_encoder.", ""): v for k, v in checkpoint.items() if "smirk_encoder" in k}
@@ -178,6 +177,8 @@ def make_smirk():
 
 
 def make_l2cs():
+    from l2cs.utils import getArch
+
     model = getArch("ResNet50", 90)
     model.load_state_dict(torch.load(MODEL_DIR / "L2CSNet_gaze360.pkl", map_location="cpu"))
     model = model.to(DEVICE).eval()
@@ -187,6 +188,8 @@ def make_l2cs():
 
 
 def make_openface3():
+    from model.MLT import MLT
+
     model = MLT().to(DEVICE).eval()
     weights_path = OPENFACE3_DIR / "weights" / "stage2_epoch_7_loss_1.1606_acc_0.5589.pth"
     model.load_state_dict(torch.load(weights_path, map_location="cpu"), strict=False)
@@ -235,6 +238,8 @@ def extract_smirk(frames_bgr, smirk_model):
 
 
 def extract_l2cs(frames_bgr, l2cs_model, softmax, idx_tensor):
+    from l2cs.utils import prep_input_numpy
+
     preds = []
     with torch.inference_mode():
         for start in range(0, len(frames_bgr), ARGS.face_batch):
@@ -250,6 +255,8 @@ def extract_l2cs(frames_bgr, l2cs_model, softmax, idx_tensor):
 
 
 def extract_cpp_openface(video_path: Path):
+    import pandas as pd
+
     cpp_bin = ARGS.cpp_openface_bin.strip()
     if not cpp_bin or not Path(cpp_bin).exists():
         return None
