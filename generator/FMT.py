@@ -1,13 +1,11 @@
-import os, math, torch
+import math
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from timm.layers import use_fused_attn
-from timm.models.vision_transformer import Mlp
 
-# ==========================================
-# RoPE Implementation
-# ==========================================
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
@@ -18,7 +16,9 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, dim, 2).float().to(device) / dim))
         self.register_buffer("inv_freq", inv_freq)
         self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
@@ -37,167 +37,157 @@ class RotaryEmbedding(nn.Module):
             self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
 
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
+
 def apply_rotary_pos_emb(q, k, cos, sin):
-    cos = cos.unsqueeze(0).unsqueeze(0) 
+    cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-# ==========================================
-# Core Modules
-# ==========================================
 
-class Attention(nn.Module):
-    def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
-    ) -> None:
-
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.fused_attn = use_fused_attn()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+    def forward(self, x):
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(mean_square + self.eps)
+        return x * self.weight
 
-    def forward(self, x: torch.Tensor, rotary_pos_emb=None) -> torch.Tensor:
-        B, N, C = x.shape
-        
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
 
-        if rotary_pos_emb is not None:
-            cos, sin = rotary_pos_emb
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size = 256):
+class ScalarEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    def timestep_embedding(t, dim, max_period=10000):
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+        )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+    def forward(self, t):
+        return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
+
 
 class SequenceEmbed(nn.Module):
-    def __init__(
-            self,
-            dim_w,
-            dim_h,
-            norm_layer=None,
-            bias=True,
-    ):
+    def __init__(self, in_dim, out_dim, bias=True):
         super().__init__()
-        self.proj = nn.Linear(dim_w, dim_h, bias=bias)
-        self.norm = norm_layer(dim_h) if norm_layer else nn.Identity()
+        self.proj = nn.Linear(in_dim, out_dim, bias=bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.proj(x))
+    def forward(self, x):
+        return self.proj(x)
+
+
+class SwiGLUMlp(nn.Module):
+    def __init__(self, in_features, hidden_features):
+        super().__init__()
+        self.w1 = nn.Linear(in_features, hidden_features, bias=False)
+        self.w3 = nn.Linear(in_features, hidden_features, bias=False)
+        self.w2 = nn.Linear(hidden_features, in_features, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = False
+
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.out_proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, rotary_pos_emb=None):
+        bsz, seq_len, dim = x.shape
+        q = self.q_proj(x).reshape(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if rotary_pos_emb is not None:
+            cos, sin = rotary_pos_emb
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if self.fused_attn:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+        else:
+            attn = (q * self.scale) @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            out = attn @ v
+
+        out = out.transpose(1, 2).reshape(bsz, seq_len, dim)
+        out = self.out_proj(out)
+        return self.proj_drop(out)
 
 
 class FMTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs) -> None:
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        self.norm1 = RMSNorm(hidden_size)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=False)
+        self.norm2 = RMSNorm(hidden_size)
+        self.mlp = SwiGLUMlp(hidden_size, int(hidden_size * mlp_ratio))
+        self.attn_scale = nn.Parameter(torch.zeros(hidden_size))
+        self.mlp_scale = nn.Parameter(torch.zeros(hidden_size))
 
-    def framewise_modulate(self, x, shift, scale) -> torch.Tensor:
-        return x * (1 + scale) + shift
-
-    def forward(self, x, c, rotary_pos_emb=None) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)        
-        x = x + gate_msa * self.attn(self.framewise_modulate(self.norm1(x), shift_msa, scale_msa), rotary_pos_emb=rotary_pos_emb)
-        x = x + gate_mlp * self.mlp(self.framewise_modulate(self.norm2(x), shift_mlp, scale_mlp))
+    def forward(self, x, rotary_pos_emb=None):
+        x = x + self.attn(self.norm1(x), rotary_pos_emb=rotary_pos_emb) * self.attn_scale
+        x = x + self.mlp(self.norm2(x)) * self.mlp_scale
         return x
 
-class Decoder(nn.Module):
-    def __init__(self, hidden_size, dim_w):
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, out_dim):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-        self.linear = nn.Linear(hidden_size, dim_w, bias=True)
+        self.norm = RMSNorm(hidden_size)
+        self.linear = nn.Linear(hidden_size, out_dim, bias=True)
 
-    def framewise_modulate(self, x, shift, scale) -> torch.Tensor:
-        return x * (1 + scale) + shift
+    def forward(self, x):
+        return self.linear(self.norm(x))
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = self.framewise_modulate(self.norm_final(x), shift, scale)
-        return self.linear(x)
-
-# ==========================================
-# Main Model
-# ==========================================
 
 class FlowMatchingTransformer(nn.Module):
-    def __init__(self, opt) -> None:
+    def __init__(self, opt):
         super().__init__()
         self.opt = opt
 
@@ -208,65 +198,90 @@ class FlowMatchingTransformer(nn.Module):
         self.hidden_size = opt.dim_h
         self.mlp_ratio = opt.mlp_ratio
         self.fmt_depth = opt.fmt_depth
+        self.aux_head_depth = opt.aux_head_depth
         self.num_heads = opt.num_heads
 
-        self.x_embedder = SequenceEmbed(2 * opt.dim_motion, self.hidden_size)
+        if not (0 < self.aux_head_depth < self.fmt_depth):
+            raise ValueError("aux_head_depth must be in (0, fmt_depth)")
 
-        # RoPE Setup
+        self.x_embedder = SequenceEmbed(2 * opt.dim_motion, self.hidden_size)
+        self.audio_embedder = SequenceEmbed(opt.dim_c, self.hidden_size)
+        self.gaze_embedder = SequenceEmbed(opt.dim_c, self.hidden_size)
+        self.pose_embedder = SequenceEmbed(opt.dim_c, self.hidden_size)
+        self.cam_embedder = SequenceEmbed(opt.dim_c, self.hidden_size)
+
         head_dim = self.hidden_size // self.num_heads
         self.rotary_emb = RotaryEmbedding(head_dim)
 
-        self.t_embedder = TimestepEmbedder(self.hidden_size)
-        self.c_embedder = nn.Linear(opt.dim_c, self.hidden_size)
+        self.h_embedder = ScalarEmbedder(self.hidden_size)
+        self.omega_embedder = ScalarEmbedder(self.hidden_size)
+        self.t_min_embedder = ScalarEmbedder(self.hidden_size)
+        self.t_max_embedder = ScalarEmbedder(self.hidden_size)
 
-        self.blocks = nn.ModuleList([
-            FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio)
-            for _ in range(self.fmt_depth)
-        ])
-        self.decoder = Decoder(self.hidden_size, self.opt.dim_motion)
+        self.num_time_tokens = opt.num_time_tokens
+        self.num_cfg_tokens = opt.num_cfg_tokens
+        self.num_interval_tokens = opt.num_interval_tokens
+
+        token_std = 1.0 / math.sqrt(self.hidden_size)
+        self.time_tokens = nn.Parameter(torch.randn(self.num_time_tokens, self.hidden_size) * token_std)
+        self.omega_tokens = nn.Parameter(torch.randn(self.num_cfg_tokens, self.hidden_size) * token_std)
+        self.t_min_tokens = nn.Parameter(torch.randn(self.num_interval_tokens, self.hidden_size) * token_std)
+        self.t_max_tokens = nn.Parameter(torch.randn(self.num_interval_tokens, self.hidden_size) * token_std)
+        self.prefix_tokens = (
+            self.num_time_tokens + self.num_cfg_tokens + 2 * self.num_interval_tokens
+        )
+
+        shared_depth = self.fmt_depth - self.aux_head_depth
+        self.shared_blocks = nn.ModuleList(
+            [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio) for _ in range(shared_depth)]
+        )
+        self.u_heads = nn.ModuleList(
+            [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio) for _ in range(self.aux_head_depth)]
+        )
+        self.v_heads = nn.ModuleList(
+            [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio) for _ in range(self.aux_head_depth)]
+        )
+
+        self.u_final = FinalLayer(self.hidden_size, self.opt.dim_motion)
+        self.v_final = FinalLayer(self.hidden_size, self.opt.dim_motion)
         self.initialize_weights()
 
-    def initialize_weights(self) -> None:
-        def _basic_init(module):
+    def initialize_weights(self):
+        for module in self.modules():
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+                    nn.init.zeros_(module.bias)
 
-        self.apply(_basic_init)
+        for block in list(self.shared_blocks) + list(self.u_heads) + list(self.v_heads):
+            nn.init.zeros_(block.attn_scale)
+            nn.init.zeros_(block.mlp_scale)
 
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        nn.init.zeros_(self.u_final.linear.weight)
+        nn.init.zeros_(self.u_final.linear.bias)
+        nn.init.zeros_(self.v_final.linear.weight)
+        nn.init.zeros_(self.v_final.linear.bias)
 
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+    def _build_prefix(self, batch_size, h, omega, t_min, t_max):
+        h_embed = self.h_embedder(h)
+        omega_embed = self.omega_embedder(1 - 1 / omega)
+        t_min_embed = self.t_min_embedder(t_min)
+        t_max_embed = self.t_max_embedder(t_max)
 
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        time_tokens = self.time_tokens.unsqueeze(0) + h_embed.unsqueeze(1)
+        omega_tokens = self.omega_tokens.unsqueeze(0) + omega_embed.unsqueeze(1)
+        t_min_tokens = self.t_min_tokens.unsqueeze(0) + t_min_embed.unsqueeze(1)
+        t_max_tokens = self.t_max_tokens.unsqueeze(0) + t_max_embed.unsqueeze(1)
 
-        nn.init.constant_(self.decoder.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.decoder.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.decoder.linear.weight, 0)
-        nn.init.constant_(self.decoder.linear.bias, 0)
+        return torch.cat([omega_tokens, t_min_tokens, t_max_tokens, time_tokens], dim=1)
 
-    def sequence_embedder(
-        self, sequence: torch.Tensor,
-        dropout_prob: float,
-        train: bool = False
-    ) -> torch.Tensor:
-        sequence = sequence.clone()
-        if train:
-            batch_id_for_drop = torch.where(
-                torch.rand(sequence.shape[0], device=sequence.device) < dropout_prob
-            )
-            sequence[batch_id_for_drop] = 0
-        return sequence
+    def _cat_prev_current(self, current, previous):
+        if previous is None:
+            return current
+        return torch.cat([previous, current], dim=1)
 
     def forward(
         self,
-        t,
         x,
         a,
         prev_x,
@@ -278,120 +293,43 @@ class FlowMatchingTransformer(nn.Module):
         prev_pose,
         cam,
         prev_cam,
-        au,
-        prev_au,
-        train: bool = True,
-        **kwargs
-    ) -> torch.Tensor:
-        t = self.t_embedder(t).unsqueeze(1) 
-        a    = self.sequence_embedder(a,    dropout_prob=self.opt.audio_dropout_prob, train=train)
-        pose = self.sequence_embedder(pose, dropout_prob=self.opt.audio_dropout_prob, train=train)
-        cam  = self.sequence_embedder(cam,  dropout_prob=self.opt.audio_dropout_prob, train=train)
-        gaze = self.sequence_embedder(gaze, dropout_prob=self.opt.audio_dropout_prob, train=train)
-        au   = self.sequence_embedder(au,   dropout_prob=self.opt.au_dropout_prob, train=train)
+        h,
+        omega,
+        t_min,
+        t_max,
+        return_v=True,
+    ):
+        x = self._cat_prev_current(x, prev_x)
+        a = self._cat_prev_current(a, prev_a)
+        gaze = self._cat_prev_current(gaze, prev_gaze)
+        pose = self._cat_prev_current(pose, prev_pose)
+        cam = self._cat_prev_current(cam, prev_cam)
 
-        if prev_x is not None:
-            prev_x    = self.sequence_embedder(prev_x,    dropout_prob=0.5, train=train)
-            prev_a    = self.sequence_embedder(prev_a,    dropout_prob=0.5, train=train)
-            prev_pose = self.sequence_embedder(prev_pose, dropout_prob=0.5, train=train)
-            prev_cam  = self.sequence_embedder(prev_cam,  dropout_prob=0.5, train=train)
-            prev_gaze = self.sequence_embedder(prev_gaze, dropout_prob=0.5, train=train)
-            prev_au   = self.sequence_embedder(prev_au,   dropout_prob=0.5, train=train)
+        ref_x = ref_x[:, None, :].expand(-1, x.shape[1], -1)
+        motion_tokens = self.x_embedder(torch.cat([ref_x, x], dim=-1))
+        motion_tokens = motion_tokens + self.audio_embedder(a)
+        motion_tokens = motion_tokens + self.gaze_embedder(gaze)
+        motion_tokens = motion_tokens + self.pose_embedder(pose)
+        motion_tokens = motion_tokens + self.cam_embedder(cam)
 
-            x    = torch.cat([prev_x, x], dim=1)
-            a    = torch.cat([prev_a, a], dim=1)
-            pose = torch.cat([prev_pose, pose], dim=1)
-            cam  = torch.cat([prev_cam, cam], dim=1)
-            gaze = torch.cat([prev_gaze, gaze], dim=1)
-            au   = torch.cat([prev_au, au], dim=1)
+        prefix = self._build_prefix(x.shape[0], h, omega, t_min, t_max)
+        seq = torch.cat([prefix, motion_tokens], dim=1)
 
-        ref_x = ref_x[:, None, ...].repeat(1, x.shape[1], 1)
-        x     = torch.cat([ref_x, x], dim=-1)
-        x     = self.x_embedder(x)
-        
-        # Calculate RoPE
-        rotary_pos_emb = self.rotary_emb(x, seq_len=x.shape[1])
+        rotary_pos_emb = self.rotary_emb(seq, seq_len=seq.shape[1])
 
-        c = self.c_embedder(a + pose + cam + gaze + au)
-        c = t + c
+        for block in self.shared_blocks:
+            seq = block(seq, rotary_pos_emb=rotary_pos_emb)
 
-        for block in self.blocks:
-            x = block(x, c, rotary_pos_emb=rotary_pos_emb)
+        u_seq = seq
+        for block in self.u_heads:
+            u_seq = block(u_seq, rotary_pos_emb=rotary_pos_emb)
+        u = self.u_final(u_seq[:, self.prefix_tokens:])
 
-        return self.decoder(x, c)
+        if not return_v:
+            return u
 
-    @torch.no_grad()
-    def forward_with_cfg(
-        self,
-        t,
-        x,
-        a,
-        prev_x,
-        prev_a,
-        ref_x,
-        gaze,
-        prev_gaze,
-        pose,
-        prev_pose,
-        cam,
-        prev_cam,
-        au,
-        prev_au,
-        a_cfg_scale: float = 1.0,
-        **kwargs
-    ) -> torch.Tensor:
-        if a_cfg_scale != 1.0:
-            null_a    = torch.zeros_like(a)
-            audio_cat     = torch.cat([null_a,    a],    dim=0)
-            gaze_cat      = torch.cat([gaze, gaze], dim=0)
-            pose_cat      = torch.cat([pose, pose], dim=0)
-            cam_cat       = torch.cat([cam,  cam],  dim=0)
-            au_cat        = torch.cat([au, au], dim=0)
-
-            x_cat         = torch.cat([x, x], dim=0)
-            prev_x_cat    = torch.cat([prev_x, prev_x], dim=0)
-            prev_a_cat    = torch.cat([prev_a, prev_a], dim=0)
-            prev_gaze_cat = torch.cat([prev_gaze, prev_gaze], dim=0)
-            prev_pose_cat = torch.cat([prev_pose, prev_pose], dim=0)
-            prev_cam_cat  = torch.cat([prev_cam, prev_cam], dim=0)
-            prev_au_cat   = torch.cat([prev_au, prev_au], dim=0)
-            ref_x_cat     = torch.cat([ref_x, ref_x], dim=0)
-
-            model_output = self.forward(
-                t=t,
-                x=x_cat,
-                a=audio_cat,
-                prev_x=prev_x_cat,
-                prev_a=prev_a_cat,
-                ref_x=ref_x_cat,
-                gaze=gaze_cat,
-                prev_gaze=prev_gaze_cat,
-                pose=pose_cat,
-                prev_pose=prev_pose_cat,
-                cam=cam_cat,
-                prev_cam=prev_cam_cat,
-                au=au_cat,
-                prev_au=prev_au_cat,
-                train=False
-            )
-            uncond, all_cond = torch.chunk(model_output, chunks=2, dim=0)
-            return uncond + a_cfg_scale * (all_cond - uncond)
-
-        else:
-            return self.forward(
-                t=t,
-                x=x,
-                a=a,
-                prev_x=prev_x,
-                prev_a=prev_a,
-                ref_x=ref_x,
-                gaze=gaze,
-                prev_gaze=prev_gaze,
-                pose=pose,
-                prev_pose=prev_pose,
-                cam=cam,
-                prev_cam=prev_cam,
-                au=au,
-                prev_au=prev_au,
-                train=False
-            )
+        v_seq = seq
+        for block in self.v_heads:
+            v_seq = block(v_seq, rotary_pos_emb=rotary_pos_emb)
+        v = self.v_final(v_seq[:, self.prefix_tokens:])
+        return u, v

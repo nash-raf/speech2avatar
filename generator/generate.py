@@ -1,13 +1,9 @@
-import math
 import os
-import sys
-import time
 import datetime
 import random
 import tempfile
 import subprocess
 import argparse
-from pathlib import Path
 from typing import Tuple, Optional
 
 import numpy as np
@@ -20,13 +16,9 @@ from PIL import Image
 import torchvision.transforms as transforms
 from transformers import Wav2Vec2FeatureExtractor
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 from generator.FM import FMGenerator
 from renderer.models import IMTRenderer
-from generator.options.base_options import BaseOptions
+from options.base_options import BaseOptions
 
 
 def load_smirk_params(smirk_data):
@@ -143,11 +135,19 @@ class InferenceAgent:
             state_dict = state_dict['model']
 
         stripped_state_dict = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-        
+        loaded, skipped = 0, 0
         with torch.no_grad():
             for name, param in self.fm.named_parameters():
                 if name in stripped_state_dict:
-                    param.copy_(stripped_state_dict[name].to(rank))
+                    incoming = stripped_state_dict[name]
+                    if incoming.shape == param.shape:
+                        param.copy_(incoming.to(rank))
+                        loaded += 1
+                    else:
+                        skipped += 1
+        print(f"[INFO] Loaded {loaded} generator params from {checkpoint_path}")
+        if skipped:
+            print(f"[INFO] Skipped {skipped} generator params due to shape mismatch")
 
     def save_video(self, vid_tensor, video_path, audio_path):
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
@@ -167,126 +167,32 @@ class InferenceAgent:
             os.remove(temp_filename)
         return video_path
 
-    def _build_static_condition_sequence(self, audio_tensor, sequence=None, feature_dim=3, jitter_scale=0.0):
-        """Build a static conditioning sequence.
-
-        Args:
-            jitter_scale: standard deviation of Gaussian noise added to the
-                repeated resting condition. Defaults to 0 for perfectly static
-                conditioning.
-        """
-        batch_size = audio_tensor.shape[0]
-        seq_len = math.ceil(audio_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-        device = audio_tensor.device
-        dtype = audio_tensor.dtype
-
-        if sequence is None:
-            static = torch.zeros(batch_size, seq_len, feature_dim, device=device, dtype=dtype)
-            if jitter_scale > 0:
-                static = static + torch.randn_like(static) * jitter_scale
-            return static
-
-        sequence = sequence.to(device=device, dtype=dtype)
-        if sequence.dim() == 2:
-            sequence = sequence.unsqueeze(0)
-        elif sequence.dim() != 3:
-            raise ValueError(f"Expected conditioning sequence with 2 or 3 dims, got shape {tuple(sequence.shape)}")
-
-        if sequence.shape[-1] != feature_dim:
-            raise ValueError(f"Expected conditioning feature dim {feature_dim}, got {sequence.shape[-1]}")
-
-        if sequence.shape[0] == 1 and batch_size > 1:
-            sequence = sequence.expand(batch_size, -1, -1)
-        elif sequence.shape[0] != batch_size:
-            raise ValueError(
-                f"Expected conditioning batch size {batch_size}, got {sequence.shape[0]} for shape {tuple(sequence.shape)}"
-            )
-
-        resting = sequence[:, :1, :]
-        static = resting.expand(batch_size, seq_len, feature_dim).clone()
-        if jitter_scale > 0:
-            static = static + torch.randn_like(static) * jitter_scale
-        return static
-
-    def _build_static_pose_sequence(self, audio_tensor, pose_sequence=None, jitter_scale=0.0):
-        return self._build_static_condition_sequence(
-            audio_tensor, sequence=pose_sequence, feature_dim=3, jitter_scale=jitter_scale
-        )
-
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
-        t_total_start = time.perf_counter()
-
-        t0 = time.perf_counter()
         data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
-        data["s"] = data["s"].to(self.opt.rank)
-        data["a"] = data["a"].to(self.opt.rank)
-
-        batch_size = data["a"].shape[0]
-        device = data["a"].device
-        dtype = data["a"].dtype
-
+        
         if pose_path and os.path.exists(pose_path):
             data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
-            data["pose"] = data["pose"].to(device=device, dtype=dtype)
-            data["cam"] = data["cam"].to(device=device, dtype=dtype)
         else:
-            data["pose"] = None
-            data["cam"] = None
-
-        data["pose"] = self._build_static_condition_sequence(data["a"], data["pose"], feature_dim=3, jitter_scale=0.0)
-        data["cam"] = None
+            data["pose"], data["cam"] = None, None
 
         if gaze_path and os.path.exists(gaze_path):
-            data["gaze"] = torch.tensor(np.load(gaze_path), dtype=dtype, device=device)
+            data["gaze"] = torch.tensor(np.load(gaze_path), dtype=torch.float32).cuda()
         else:
             data["gaze"] = None
-
-        au_path = kwargs.get("au_path")
-        if au_path and os.path.exists(au_path):
-            data["au"] = torch.tensor(np.load(au_path), dtype=dtype, device=device)
-        else:
-            data["au"] = None
-        preprocess_sec = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        f_r, t_r, g_r = self.encode_image(data["s"])
+        
+        f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
         data["ref_x"] = t_r
-        encode_sec = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
-        torch.cuda.synchronize()
-        motion_gen_sec = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
+        sample = self.fm.sample(
+            data,
+            a_cfg_scale=kwargs.get('a_cfg_scale', self.opt.a_cfg_scale),
+            nfe=kwargs.get('nfe', self.opt.nfe),
+            seed=kwargs.get('seed', self.opt.seed),
+        )
         data_out = self.decode_image(f_r, t_r, sample, g_r)
-        torch.cuda.synchronize()
-        render_sec = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        result = self.save_video(data_out["d_hat"], res_path, aud_path)
-        save_sec = time.perf_counter() - t0
-
-        total_sec = time.perf_counter() - t_total_start
-        num_frames = sample.shape[1]
-        fps_actual = num_frames / total_sec
-
-        print(f"\n{'='*50}")
-        print(f"  Inference Timing Summary")
-        print(f"{'='*50}")
-        print(f"  Preprocess (image+audio) : {preprocess_sec:6.2f}s")
-        print(f"  Encode source image      : {encode_sec:6.2f}s")
-        print(f"  Motion generation (ODE)  : {motion_gen_sec:6.2f}s")
-        print(f"  Render frames            : {render_sec:6.2f}s")
-        print(f"  Save video + mux audio   : {save_sec:6.2f}s")
-        print(f"{'─'*50}")
-        print(f"  Total                    : {total_sec:6.2f}s")
-        print(f"  Frames generated         : {num_frames}")
-        print(f"  Effective speed          : {fps_actual:6.2f} frames/sec")
-        print(f"{'='*50}\n")
-
-        return result
+        
+        return self.save_video(data_out["d_hat"], res_path, aud_path)
 
     @torch.no_grad()
     def encode_image(self, x):
@@ -313,9 +219,8 @@ class InferenceOptions(BaseOptions):
     def initialize(self, parser):
         super().initialize(parser)
         parser.add_argument("--ref_path", type=str, default=None)
-        parser.add_argument("--pose_path", type=str, default=None, help="Pose .pt file or directory of per-sample .pt files")
-        parser.add_argument("--gaze_path", type=str, default=None, help="Gaze .npy file or directory of per-sample .npy files")
-        parser.add_argument("--au_path", type=str, default=None, help="AU .npy file or directory of per-sample .npy files")
+        parser.add_argument("--pose_path", type=str, default=None)
+        parser.add_argument("--gaze_path", type=str, default=None)
         parser.add_argument('--aud_path', type=str, default=None)
         parser.add_argument('--crop', action='store_true')
         parser.add_argument('--res_video_path', type=str, default=None)
@@ -326,23 +231,12 @@ class InferenceOptions(BaseOptions):
         return parser
 
 
-def resolve_condition_path(path_value, sample_name, extension):
-    if not path_value:
-        return None
-
-    if os.path.isfile(path_value):
-        return path_value
-
-    if os.path.isdir(path_value):
-        return os.path.join(path_value, f"{sample_name}{extension}")
-
-    return path_value
-
-
 def process_item(agent, ref, aud, name, opt):
-    pose = resolve_condition_path(getattr(opt, "pose_path", None), name, ".pt")
-    gaze = resolve_condition_path(getattr(opt, "gaze_path", None), name, ".npy")
-    au = resolve_condition_path(getattr(opt, "au_path", None), name, ".npy")
+    pose_root = getattr(opt, "pose_path", None)
+    gaze_root = getattr(opt, "gaze_path", None)
+    
+    pose = os.path.join(pose_root, f"{name}.pt") if pose_root else None
+    gaze = os.path.join(gaze_root, f"{name}.npy") if gaze_root else None
     
     out_path = os.path.join(opt.res_dir, f"{name}.mp4")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -351,7 +245,7 @@ def process_item(agent, ref, aud, name, opt):
     try:
         agent.run_inference(
             out_path, ref, aud, pose, gaze,
-            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed, au_path=au
+            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed
         )
     except Exception as e:
         print(f"Error processing {name}: {e}")
@@ -387,3 +281,5 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
+
+

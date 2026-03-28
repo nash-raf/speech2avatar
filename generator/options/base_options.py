@@ -20,7 +20,7 @@ class BaseOptions():
 		# audio
 		parser.add_argument('--sampling_rate', type=int, default=16000)
 		parser.add_argument('--audio_marcing', type=int, default=2, help='number of adjacent frames. For value v, t -> [t-v, ..., t, ..., t+v]')        
-		parser.add_argument('--wav2vec_sec', default=2, type=float, help='window length L (seconds), 50 frames at 25fps')
+		parser.add_argument('--wav2vec_sec', default=2, type=float, help='window length L (seconds), 50 frames')
 		parser.add_argument('--wav2vec_model_path', default='./checkpoints/wav2vec2-base-960h')
 		parser.add_argument('--attention_window', default=5, type=int, help='attention window size, e.g., if 1, attend frames of t-1, t, t+1 for frame t')
 
@@ -31,7 +31,6 @@ class BaseOptions():
 		parser.add_argument('--audio_dropout_prob', default=0.1, type=float)
 		parser.add_argument('--ref_dropout_prob', default=0.1, type=float)
 		parser.add_argument('--emotion_dropout_prob', default=0.1, type=float)
-		parser.add_argument('--au_dropout_prob', default=0.1, type=float)
 
 		# model Hyper Parameters
 		parser.add_argument('--style_dim', type=int, default=512, help='w latent dimension')
@@ -41,22 +40,31 @@ class BaseOptions():
 		parser.add_argument("--dim_motion", type=int, default=32)
 		parser.add_argument("--dim_c", type=int, default=32)
 		parser.add_argument('--dim_w', type=int, default=32, help='face dimension')
-		parser.add_argument('--num_aus', default=17, type=int, help='number of AU conditioning channels')
 
 		# option for FMT
 		parser.add_argument('--fmt_depth', default=8, type=int)
+		parser.add_argument('--aux_head_depth', default=4, type=int)
 		parser.add_argument('--num_heads', default=8, type=int)
 		parser.add_argument('--mlp_ratio', default=4.0, type=float)
 		parser.add_argument('--no_learned_pe', action='store_true')
 		parser.add_argument('--num_prev_frames', type=int, default=10)
 		parser.add_argument('--max_grad_norm', default=1, type=float, help='max grad norm for training transformers')
-		parser.add_argument('--static_pose_aug_prob', default=0.3, type=float)
-		parser.add_argument('--freeze_first_n_blocks', default=4, type=int)
+		parser.add_argument('--num_time_tokens', default=4, type=int)
+		parser.add_argument('--num_cfg_tokens', default=4, type=int)
+		parser.add_argument('--num_interval_tokens', default=2, type=int)
+
+		# iMF schedule / objective
+		parser.add_argument('--P_mean', default=-0.4, type=float)
+		parser.add_argument('--P_std', default=1.0, type=float)
+		parser.add_argument('--data_proportion', default=0.5, type=float)
+		parser.add_argument('--cfg_beta', default=1.0, type=float)
+		parser.add_argument('--norm_p', default=1.0, type=float)
+		parser.add_argument('--norm_eps', default=0.01, type=float)
 
 		parser.add_argument('--ode_atol', default=1e-5, type=float)
 		parser.add_argument('--ode_rtol', default=1e-5, type=float)
-		parser.add_argument('--nfe', default=10, type=int,
-							help='Number of Function Evaluateions (NFEs) for ODE solver')
+		parser.add_argument('--nfe', default=1, type=int,
+							help='Number of finite iMF solver steps')
 		parser.add_argument('--torchdiffeq_ode_method', default='euler',
 							help='ODE solver')
 		parser.add_argument('--a_cfg_scale', default=3, type=float,
