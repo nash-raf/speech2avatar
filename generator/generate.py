@@ -4,6 +4,7 @@ import random
 import tempfile
 import subprocess
 import argparse
+import time
 from typing import Tuple, Optional
 
 import numpy as np
@@ -169,8 +170,10 @@ class InferenceAgent:
 
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
+        t0 = time.perf_counter()
         data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
-        
+        t1 = time.perf_counter()
+
         if pose_path and os.path.exists(pose_path):
             data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
         else:
@@ -180,9 +183,10 @@ class InferenceAgent:
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=torch.float32).cuda()
         else:
             data["gaze"] = None
-        
+
         f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
         data["ref_x"] = t_r
+        t2 = time.perf_counter()
 
         sample = self.fm.sample(
             data,
@@ -190,9 +194,33 @@ class InferenceAgent:
             nfe=kwargs.get('nfe', self.opt.nfe),
             seed=kwargs.get('seed', self.opt.seed),
         )
+        t3 = time.perf_counter()
+
         data_out = self.decode_image(f_r, t_r, sample, g_r)
-        
-        return self.save_video(data_out["d_hat"], res_path, aud_path)
+        t4 = time.perf_counter()
+
+        out_path = self.save_video(data_out["d_hat"], res_path, aud_path)
+        t5 = time.perf_counter()
+
+        num_frames = int(sample.shape[1])
+        total = t5 - t0
+        fps = num_frames / total if total > 0 else 0.0
+
+        print("\n" + "=" * 50)
+        print("  Inference Timing Summary")
+        print("=" * 50)
+        print(f"  Preprocess (image+audio) : {t1 - t0:6.2f}s")
+        print(f"  Encode source image      : {t2 - t1:6.2f}s")
+        print(f"  Motion generation (ODE)  : {t3 - t2:6.2f}s")
+        print(f"  Render frames            : {t4 - t3:6.2f}s")
+        print(f"  Save video + mux audio   : {t5 - t4:6.2f}s")
+        print("─" * 50)
+        print(f"  Total                    : {total:6.2f}s")
+        print(f"  Frames generated         : {num_frames}")
+        print(f"  Effective speed          : {fps:6.2f} frames/sec")
+        print("=" * 50 + "\n")
+
+        return out_path
 
     @torch.no_grad()
     def encode_image(self, x):
