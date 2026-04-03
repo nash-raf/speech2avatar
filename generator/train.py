@@ -497,6 +497,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--display_freq", type=int, default=10000)
         parser.add_argument("--resume_ckpt", type=str, default=None)
         parser.add_argument("--rank", type=str, default="cuda")
+        parser.add_argument("--renderer_path", type=str, default="./checkpoints/renderer.ckpt")
         parser.add_argument("--train_num_workers", type=int, default=default_cpu_workers)
         parser.add_argument("--val_num_workers", type=int, default=max(2, default_cpu_workers // 2))
         parser.add_argument("--prefetch_factor", type=int, default=4)
