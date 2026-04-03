@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -76,15 +77,32 @@ class System(pl.LightningModule):
         self.preview_data = None
         self.last_preview_step = -1
         self.last_preview_video_step = -1
+        self.train_batch_start_time = None
+        self.validation_epoch_start_time = None
+        self.preview_start_time = None
+
+    def on_train_batch_start(self, batch, batch_idx):
+        self.train_batch_start_time = time.perf_counter()
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self.ema.update()
+        if self.train_batch_start_time is not None:
+            step_time = time.perf_counter() - self.train_batch_start_time
+            batch_size = batch["m_now"].shape[0]
+            samples_per_sec = batch_size / max(step_time, 1e-6)
+            self.log("perf/train_step_sec", step_time, prog_bar=False, on_step=True, on_epoch=False)
+            self.log("perf/train_samples_per_sec", samples_per_sec, prog_bar=False, on_step=True, on_epoch=False)
 
     def on_validation_epoch_start(self):
         self.ema.apply_shadow()
+        self.validation_epoch_start_time = time.perf_counter()
 
     def on_validation_epoch_end(self):
         self._log_preview()
+        if self.validation_epoch_start_time is not None:
+            val_time = time.perf_counter() - self.validation_epoch_start_time
+            self.log("perf/val_epoch_sec", val_time, prog_bar=False, on_step=False, on_epoch=True)
+            print(f"[TIMING] validation_epoch={val_time:.2f}s at step={self.global_step}")
         self.ema.restore()
 
     def on_save_checkpoint(self, checkpoint):
@@ -331,6 +349,7 @@ class System(pl.LightningModule):
         if data is None:
             return
 
+        self.preview_start_time = time.perf_counter()
         self.model.eval()
         f_r, g_r = self.preview_renderer.dense_feature_encoder(data["s"])
         t_r = self.preview_renderer.latent_token_encoder(data["s"])
@@ -370,6 +389,16 @@ class System(pl.LightningModule):
         if need_video:
             self._save_preview_video(frames)
             self.last_preview_video_step = self.global_step
+
+        if self.preview_start_time is not None:
+            preview_time = time.perf_counter() - self.preview_start_time
+            self.log("perf/preview_sec", preview_time, prog_bar=False, on_step=False, on_epoch=False)
+            print(
+                f"[TIMING] preview step={self.global_step} "
+                f"image={'yes' if need_image else 'no'} "
+                f"video={'yes' if need_video else 'no'} "
+                f"time={preview_time:.2f}s"
+            )
 
         self.model.train()
 
