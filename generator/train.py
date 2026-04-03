@@ -509,6 +509,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--preview_every_n_val", type=int, default=5000)
         parser.add_argument("--preview_video_every_n_val", type=int, default=15000)
         parser.add_argument("--preview_a_cfg_scale", type=float, default=1.0)
+        parser.add_argument("--val_holdout", type=int, default=100)
         return parser
 
 
@@ -518,8 +519,12 @@ class DataModule(pl.LightningDataModule):
         self.opt = opt
 
     def setup(self, stage):
-        self.train_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=-100)
-        self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=-100, end=-1)
+        if self.opt.val_holdout <= 0:
+            self.train_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=None)
+            self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=1)
+        else:
+            self.train_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=-self.opt.val_holdout)
+            self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=-self.opt.val_holdout, end=None)
 
     def _loader_kwargs(self, num_workers, shuffle, drop_last):
         kwargs = {
