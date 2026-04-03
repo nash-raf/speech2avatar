@@ -392,7 +392,7 @@ class System(pl.LightningModule):
 
         if self.preview_start_time is not None:
             preview_time = time.perf_counter() - self.preview_start_time
-            self.log("perf/preview_sec", preview_time, prog_bar=False, on_step=False, on_epoch=False)
+            self.log("perf/preview_sec", preview_time, prog_bar=False, on_step=False, on_epoch=True)
             print(
                 f"[TIMING] preview step={self.global_step} "
                 f"image={'yes' if need_image else 'no'} "
