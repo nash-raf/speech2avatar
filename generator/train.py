@@ -1,9 +1,13 @@
 import argparse
 import math
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -11,13 +15,18 @@ from torch import optim
 from torch.func import jvp
 from torch.utils import data
 
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.benchmark = True
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from generator.dataset import AudioMotionSmirkGazeDataset
 from generator.FM import FMGenerator
+from generator.generate import DataProcessor, load_smirk_params
 from generator.options.base_options import BaseOptions
+from renderer.models import IMTRenderer
 
 
 class EMA:
@@ -62,6 +71,11 @@ class System(pl.LightningModule):
         self.model = FMGenerator(opt)
         self.opt = opt
         self.ema = EMA(self.model, decay=0.9999)
+        self.preview_renderer = None
+        self.preview_processor = None
+        self.preview_data = None
+        self.last_preview_step = -1
+        self.last_preview_video_step = -1
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self.ema.update()
@@ -70,6 +84,7 @@ class System(pl.LightningModule):
         self.ema.apply_shadow()
 
     def on_validation_epoch_end(self):
+        self._log_preview()
         self.ema.restore()
 
     def on_save_checkpoint(self, checkpoint):
@@ -246,6 +261,153 @@ class System(pl.LightningModule):
         self.log("val_loss_u", metrics["loss_u"], prog_bar=True)
         self.log("val_loss_v", metrics["loss_v"], prog_bar=True)
 
+    def _init_preview(self):
+        if not self.opt.preview_ref_path or not self.opt.preview_aud_path:
+            return False
+        if self.preview_renderer is not None:
+            return True
+        if not os.path.exists(self.opt.renderer_path):
+            print(f"[WARNING] Preview disabled: renderer checkpoint not found at {self.opt.renderer_path}")
+            return False
+
+        self.preview_renderer = IMTRenderer(self.opt).to(self.device).eval()
+        renderer_ckpt = torch.load(self.opt.renderer_path, map_location="cpu")["state_dict"]
+        ae_state_dict = {k.replace("gen.", ""): v for k, v in renderer_ckpt.items() if k.startswith("gen.")}
+        self.preview_renderer.load_state_dict(ae_state_dict, strict=False)
+        self.preview_processor = DataProcessor(self.opt)
+        return True
+
+    @torch.no_grad()
+    def _load_preview_data(self):
+        if self.preview_data is not None:
+            return self.preview_data
+        if not self._init_preview():
+            return None
+
+        data = self.preview_processor.preprocess(
+            self.opt.preview_ref_path,
+            self.opt.preview_aud_path,
+            crop=self.opt.preview_crop,
+        )
+        data["s"] = data["s"].to(self.device)
+        data["a"] = data["a"].to(self.device)
+
+        if self.opt.preview_pose_path and os.path.exists(self.opt.preview_pose_path):
+            pose, cam = load_smirk_params(torch.load(self.opt.preview_pose_path, map_location="cpu"))
+            data["pose"] = pose.to(self.device)
+            data["cam"] = cam.to(self.device)
+        else:
+            data["pose"], data["cam"] = None, None
+
+        if self.opt.preview_gaze_path and os.path.exists(self.opt.preview_gaze_path):
+            gaze = torch.from_numpy(np.load(self.opt.preview_gaze_path)).float().to(self.device)
+            data["gaze"] = gaze
+        else:
+            data["gaze"] = None
+
+        self.preview_data = data
+        return data
+
+    @torch.no_grad()
+    def _log_preview(self):
+        if not self.trainer.is_global_zero:
+            return
+        if self.global_step == 0:
+            return
+        need_image = (
+            self.opt.preview_every_n_val > 0
+            and self.global_step != self.last_preview_step
+            and self.global_step % self.opt.preview_every_n_val == 0
+        )
+        need_video = (
+            self.opt.preview_video_every_n_val > 0
+            and self.global_step != self.last_preview_video_step
+            and self.global_step % self.opt.preview_video_every_n_val == 0
+        )
+        if not need_image and not need_video:
+            return
+
+        data = self._load_preview_data()
+        if data is None:
+            return
+
+        self.model.eval()
+        f_r, g_r = self.preview_renderer.dense_feature_encoder(data["s"])
+        t_r = self.preview_renderer.latent_token_encoder(data["s"])
+        ta_r = self.preview_renderer.adapt(t_r, g_r)
+        m_r = self.preview_renderer.latent_token_decoder(ta_r)
+
+        sample_input = {
+            "a": data["a"],
+            "ref_x": t_r,
+            "pose": data["pose"],
+            "cam": data["cam"],
+            "gaze": data["gaze"],
+        }
+        sample = self.model.sample(
+            sample_input,
+            a_cfg_scale=self.opt.preview_a_cfg_scale,
+            nfe=self.opt.nfe,
+            seed=self.opt.seed,
+        )
+
+        frames = []
+        for t in range(sample.shape[1]):
+            ta_c = self.preview_renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.preview_renderer.latent_token_decoder(ta_c)
+            frames.append(self.preview_renderer.decode(m_c, m_r, f_r))
+        frames = torch.stack(frames, dim=1)[0]
+
+        num_frames = frames.shape[0]
+        indices = sorted({0, num_frames // 2, num_frames - 1})
+        preview = torch.cat([frames[idx] for idx in indices], dim=2)
+        preview = ((preview.clamp(-1, 1) + 1) / 2).cpu()
+
+        if need_image and hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_image("preview/generated_triplet", preview, self.global_step)
+            self.last_preview_step = self.global_step
+
+        if need_video:
+            self._save_preview_video(frames)
+            self.last_preview_video_step = self.global_step
+
+        self.model.train()
+
+    def _save_preview_video(self, frames):
+        preview_dir = Path(self.opt.exp_path) / self.opt.exp_name / "preview_videos"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        out_path = preview_dir / f"step={self.global_step:06d}.mp4"
+
+        frames_uint8 = (
+            ((frames.clamp(-1, 1) + 1) * 127.5)
+            .byte()
+            .permute(0, 2, 3, 1)
+            .cpu()
+            .numpy()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, frame in enumerate(frames_uint8):
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(tmpdir, f"{idx:06d}.png"), frame_bgr)
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(self.opt.fps),
+                "-i",
+                os.path.join(tmpdir, "%06d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(out_path),
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print(f"[INFO] Saved preview video to {out_path}")
+
     def load_ckpt(self, ckpt_path):
         print(f"[INFO] Loading weights from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -294,6 +456,7 @@ class TrainOptions(BaseOptions):
 
     def initialize(self, parser):
         parser = super().initialize(parser)
+        default_cpu_workers = max(4, min(16, os.cpu_count() or 8))
         parser.add_argument("--dataset_path", default=None, type=str)
         parser.add_argument("--dataset_pat", dest="dataset_path", default=None, type=str, help=argparse.SUPPRESS)
         parser.add_argument("--lr", default=1e-4, type=float)
@@ -305,6 +468,18 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--display_freq", type=int, default=10000)
         parser.add_argument("--resume_ckpt", type=str, default=None)
         parser.add_argument("--rank", type=str, default="cuda")
+        parser.add_argument("--train_num_workers", type=int, default=default_cpu_workers)
+        parser.add_argument("--val_num_workers", type=int, default=max(2, default_cpu_workers // 2))
+        parser.add_argument("--prefetch_factor", type=int, default=4)
+        parser.add_argument("--precision", type=str, default="bf16-mixed")
+        parser.add_argument("--preview_ref_path", type=str, default=None)
+        parser.add_argument("--preview_aud_path", type=str, default=None)
+        parser.add_argument("--preview_pose_path", type=str, default=None)
+        parser.add_argument("--preview_gaze_path", type=str, default=None)
+        parser.add_argument("--preview_crop", action="store_true")
+        parser.add_argument("--preview_every_n_val", type=int, default=5000)
+        parser.add_argument("--preview_video_every_n_val", type=int, default=15000)
+        parser.add_argument("--preview_a_cfg_scale", type=float, default=1.0)
         return parser
 
 
@@ -317,11 +492,38 @@ class DataModule(pl.LightningDataModule):
         self.train_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=0, end=-100)
         self.val_dataset = AudioMotionSmirkGazeDataset(opt=self.opt, start=-100, end=-1)
 
+    def _loader_kwargs(self, num_workers, shuffle, drop_last):
+        kwargs = {
+            "num_workers": num_workers,
+            "batch_size": self.opt.batch_size if shuffle else min(8, self.opt.batch_size),
+            "shuffle": shuffle,
+            "drop_last": drop_last,
+            "pin_memory": True,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = True
+            kwargs["prefetch_factor"] = self.opt.prefetch_factor
+        return kwargs
+
     def train_dataloader(self):
-        return data.DataLoader(self.train_dataset, num_workers=8, batch_size=self.opt.batch_size, shuffle=True)
+        return data.DataLoader(
+            self.train_dataset,
+            **self._loader_kwargs(
+                num_workers=self.opt.train_num_workers,
+                shuffle=True,
+                drop_last=True,
+            ),
+        )
 
     def val_dataloader(self):
-        return data.DataLoader(self.val_dataset, num_workers=0, batch_size=min(8, self.opt.batch_size), shuffle=False)
+        return data.DataLoader(
+            self.val_dataset,
+            **self._loader_kwargs(
+                num_workers=self.opt.val_num_workers,
+                shuffle=False,
+                drop_last=False,
+            ),
+        )
 
 
 if __name__ == "__main__":
@@ -351,6 +553,7 @@ if __name__ == "__main__":
         logger=logger,
         callbacks=[checkpoint_callback],
         enable_progress_bar=True,
+        precision=opt.precision,
     )
 
     trainer.fit(system, dm)
