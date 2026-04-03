@@ -29,6 +29,7 @@ class FMGenerator(nn.Module):
         self.pose_projection = self._make_projection(3, opt.dim_c)
         self.cam_projection = self._make_projection(3, opt.dim_c)
 
+        self._freeze_frontend()
         self._print_model_stats()
 
     def _make_projection(self, in_dim, out_dim):
@@ -38,10 +39,23 @@ class FMGenerator(nn.Module):
             nn.SiLU(),
         )
 
+    @staticmethod
+    def _freeze_module(module):
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _freeze_frontend(self):
+        # Keep the original input/conditioning front-end fixed and only adapt the motion backbone + heads.
+        self._freeze_module(self.audio_projection)
+        self._freeze_module(self.gaze_projection)
+        self._freeze_module(self.pose_projection)
+        self._freeze_module(self.cam_projection)
+
     def _print_model_stats(self):
-        trainable = sum(p.numel() for p in self.fmt.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.fmt.parameters())
-        print(f"\n[Model Stats] Parameters: {total:,} | Trainable: {trainable:,}")
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen = total - trainable
+        print(f"\n[Model Stats] Parameters: {total:,} | Trainable: {trainable:,} | Frozen: {frozen:,}")
 
     def _get_batch_item(self, batch, name):
         if name in batch:
