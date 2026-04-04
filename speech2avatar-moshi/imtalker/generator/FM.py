@@ -101,8 +101,19 @@ class FMGenerator(nn.Module):
             return torch.cat([tensor, padding], dim=0)
         return tensor
 
+    def _ensure_prev_context(self, tensor, batch_size, feat_dim, device):
+        if tensor is None:
+            return torch.zeros(batch_size, self.num_prev_frames, feat_dim, device=device)
+        if tensor.shape[1] > self.num_prev_frames:
+            return tensor[:, -self.num_prev_frames:]
+        if tensor.shape[1] < self.num_prev_frames:
+            pad_len = self.num_prev_frames - tensor.shape[1]
+            padding = torch.zeros(batch_size, pad_len, feat_dim, device=device, dtype=tensor.dtype)
+            return torch.cat([padding, tensor], dim=1)
+        return tensor
+
     @torch.no_grad()
-    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None):
+    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None, stream_state=None, return_state=False):
         ref_x = data['ref_x']
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
@@ -152,6 +163,7 @@ class FMGenerator(nn.Module):
         # Generation Loop
         sample = []
         num_chunks = int(math.ceil(T / self.num_frames_for_clip))
+        next_stream_state = None
 
         for t in range(num_chunks):
             # Setup Initial Noise
@@ -165,11 +177,36 @@ class FMGenerator(nn.Module):
 
             # Setup Previous Context
             if t == 0:
-                prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
-                prev_a_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
-                prev_gaze_t = torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
-                prev_pose_t = torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
-                prev_cam_t = torch.zeros(B, self.num_prev_frames, cam.shape[-1], device=device)
+                prev_x_t = self._ensure_prev_context(
+                    None if stream_state is None else stream_state.get("prev_x"),
+                    B,
+                    self.opt.dim_w,
+                    device,
+                )
+                prev_a_t = self._ensure_prev_context(
+                    None if stream_state is None else stream_state.get("prev_a"),
+                    B,
+                    a.shape[-1],
+                    device,
+                )
+                prev_gaze_t = self._ensure_prev_context(
+                    None if stream_state is None else stream_state.get("prev_gaze"),
+                    B,
+                    gaze.shape[-1],
+                    device,
+                )
+                prev_pose_t = self._ensure_prev_context(
+                    None if stream_state is None else stream_state.get("prev_pose"),
+                    B,
+                    pose.shape[-1],
+                    device,
+                )
+                prev_cam_t = self._ensure_prev_context(
+                    None if stream_state is None else stream_state.get("prev_cam"),
+                    B,
+                    cam.shape[-1],
+                    device,
+                )
             else:
                 prev_x_t = sample_t[:, -self.num_prev_frames:]
                 prev_a_t = a_t[:, -self.num_prev_frames:]
@@ -219,8 +256,17 @@ class FMGenerator(nn.Module):
             trajectory_t = odeint(sample_chunk, x0, time_steps, **self.odeint_kwargs)
             sample_t = trajectory_t[-1]
             sample.append(sample_t)
+            next_stream_state = {
+                "prev_x": sample_t[:, -self.num_prev_frames:].detach(),
+                "prev_a": a_t[:, -self.num_prev_frames:].detach(),
+                "prev_gaze": gaze_t[:, -self.num_prev_frames:].detach(),
+                "prev_pose": pose_t[:, -self.num_prev_frames:].detach(),
+                "prev_cam": cam_t[:, -self.num_prev_frames:].detach(),
+            }
 
         sample = torch.cat(sample, dim=1)[:, :T]
+        if return_state:
+            return sample, next_stream_state
         return sample
 
 
