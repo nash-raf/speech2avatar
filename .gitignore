@@ -1,5 +1,16 @@
-checkpoints/
 **/__pycache__/
 *.pyc
+.DS_Store
 
+**/checkpoints/
+**/exps/
+**/eval_results/
+**/results/
+**/tb_exports/
+**/preview_videos/
+step=*.mp4
+**/wandb/
 
+**/.ipynb_checkpoints/
+**/.pytest_cache/
+**/.mypy_cache/
