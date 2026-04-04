@@ -19,7 +19,7 @@ class FMGenerator(nn.Module):
         self.num_prev_frames = int(opt.num_prev_frames)
         self.num_total_frames = self.num_frames_for_clip + self.num_prev_frames
         
-        self.audio_input_dim = 768 if opt.only_last_features else 12 * 768
+        self.audio_input_dim = getattr(opt, 'audio_feat_dim', 768 if opt.only_last_features else 12 * 768)
         
         # Components
         self.audio_encoder = AudioEncoder(opt)
@@ -56,9 +56,9 @@ class FMGenerator(nn.Module):
         a, prev_a = batch["a_now"], batch["a_prev"]
         m_ref = batch["m_ref"]
         
-        gaze, prev_gaze = batch["gaze"], batch["gaze_prev"]
-        pose, prev_pose = batch["pose"], batch["pose_prev"]
-        cam, prev_cam = batch["cam"], batch["cam_prev"]
+        gaze, prev_gaze = batch["gaze_now"], batch["gaze_prev"]
+        pose, prev_pose = batch["pose_now"], batch["pose_prev"]
+        cam, prev_cam = batch["cam_now"], batch["cam_prev"]
 
         bs = x.size(0)
 
@@ -103,20 +103,30 @@ class FMGenerator(nn.Module):
 
     @torch.no_grad()
     def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None):
-        a, ref_x = data['a'], data['ref_x']
+        ref_x = data['ref_x']
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
         cam_raw = data.get('cam')
-        
-        B = a.shape[0]
-        device = self.rank
-        time_steps = torch.linspace(0, 1, nfe, device=device)
 
-        # Process Audio
-        a = a.to(device)
-        T = math.ceil(a.shape[-1] * self.fps / self.opt.sampling_rate)
-        a = self.audio_encoder.inference(a, seq_len=T)
-        a = self.audio_projection(a)
+        device = self.rank
+
+        # Process Audio — precomputed features or raw waveform
+        if 'a_feat' in data:
+            # Precomputed features path (Mimi or any offline features)
+            a_feat = data['a_feat'].to(device)
+            if a_feat.ndim == 2:
+                a_feat = a_feat.unsqueeze(0)
+            T = a_feat.shape[1]
+            a = self.audio_projection(a_feat)
+        else:
+            # Raw waveform path (Wav2Vec)
+            a = data['a'].to(device)
+            T = math.ceil(a.shape[-1] * self.fps / self.opt.sampling_rate)
+            a = self.audio_encoder.inference(a, seq_len=T)
+            a = self.audio_projection(a)
+
+        B = a.shape[0]
+        time_steps = torch.linspace(0, 1, nfe, device=device)
 
         # Process Conditions (Gaze, Pose, Cam)
         gaze = self._align_sequence(gaze_raw, T)

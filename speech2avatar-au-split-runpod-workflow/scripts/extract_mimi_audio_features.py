@@ -169,7 +169,8 @@ def encode_mimi_features(mimi, wav: torch.Tensor, device: str, quantize: bool, t
     wav = wav.to(device)
     with torch.inference_mode():
         latent = mimi.encode_to_latent(wav, quantize=quantize).float()
-        latent = F.interpolate(latent, size=target_frames, mode="linear", align_corners=False)
+        # Motion length is the source of truth. Interpolate Mimi time steps to exactly match it.
+        latent = F.interpolate(latent, size=target_frames, mode="linear", align_corners=True)
     feat = latent[0].transpose(0, 1).contiguous().cpu().numpy().astype(np.float32)
     return feat
 

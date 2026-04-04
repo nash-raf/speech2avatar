@@ -24,8 +24,14 @@ class BaseOptions():
 		parser.add_argument('--wav2vec_model_path', default='./checkpoints/wav2vec2-base-960h')
 		parser.add_argument('--attention_window', default=5, type=int, help='attention window size, e.g., if 1, attend frames of t-1, t, t+1 for frame t')
 
-		parser.add_argument('--only_last_features', type=bool, default="true")
+		parser.add_argument('--only_last_features', action='store_true', default=True)
 		parser.add_argument('--average_emotion', action='store_true', help='averaging emotion or not.')
+
+		# audio feature source (Mimi integration)
+		parser.add_argument('--audio_subdir', type=str, default='audio',
+							help='Subdirectory under dataset_path for audio features (audio or audio_mimi)')
+		parser.add_argument('--audio_feat_dim', type=int, default=768,
+							help='Audio feature dimension (768 for Wav2Vec, 512 for Mimi)')
 
 		# dropout
 		parser.add_argument('--audio_dropout_prob', default=0.1, type=float)

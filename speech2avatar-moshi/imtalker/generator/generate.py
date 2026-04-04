@@ -161,8 +161,20 @@ class InferenceAgent:
 
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
-        data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
-        
+        audio_feat_path = kwargs.get('audio_feat_path', None)
+
+        if audio_feat_path and os.path.exists(audio_feat_path):
+            # Precomputed audio features path (Mimi or any offline features)
+            s = self.data_processor.default_img_loader(ref_path)
+            if kwargs.get('crop', False):
+                s = self.data_processor.process_img(s)
+            s_tensor = self.data_processor.transform(s).unsqueeze(0)
+            a_feat = torch.from_numpy(np.load(audio_feat_path)).float()
+            data = {'s': s_tensor, 'a_feat': a_feat}
+        else:
+            # Raw waveform path (Wav2Vec)
+            data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
+
         if pose_path and os.path.exists(pose_path):
             data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
         else:
@@ -172,13 +184,13 @@ class InferenceAgent:
             data["gaze"] = torch.tensor(np.load(gaze_path), dtype=torch.float32).cuda()
         else:
             data["gaze"] = None
-        
+
         f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
         data["ref_x"] = t_r
 
         sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
         data_out = self.decode_image(f_r, t_r, sample, g_r)
-        
+
         return self.save_video(data_out["d_hat"], res_path, aud_path)
 
     @torch.no_grad()
@@ -209,6 +221,8 @@ class InferenceOptions(BaseOptions):
         parser.add_argument("--pose_path", type=str, default=None)
         parser.add_argument("--gaze_path", type=str, default=None)
         parser.add_argument('--aud_path', type=str, default=None)
+        parser.add_argument('--audio_feat_path', type=str, default=None,
+                            help='Path to precomputed audio features .npy (bypasses Wav2Vec)')
         parser.add_argument('--crop', action='store_true')
         parser.add_argument('--res_video_path', type=str, default=None)
         parser.add_argument('--generator_path', type=str, default="./checkpoints/generator.ckpt")
@@ -232,7 +246,8 @@ def process_item(agent, ref, aud, name, opt):
     try:
         agent.run_inference(
             out_path, ref, aud, pose, gaze,
-            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed
+            a_cfg_scale=opt.a_cfg_scale, nfe=opt.nfe, crop=opt.crop, seed=opt.seed,
+            audio_feat_path=getattr(opt, 'audio_feat_path', None),
         )
     except Exception as e:
         print(f"Error processing {name}: {e}")
