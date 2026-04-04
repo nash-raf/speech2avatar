@@ -13,6 +13,7 @@ from torch.utils import data
 from torch import nn, optim
 from einops import rearrange, repeat
 from generator.dataset import AudioMotionSmirkGazeDataset
+from generator.audio_features import load_audio_conditioning
 from FM import FMGenerator
 from options.base_options import BaseOptions
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -190,6 +191,7 @@ class VideoGenCallback(pl.Callback):
         self.renderer = None
         self.f_r = self.t_r = self.g_r = None
         self.a_data = None
+        self.audio_cache = {}
 
     def _setup(self, device):
         import cv2
@@ -215,21 +217,16 @@ class VideoGenCallback(pl.Callback):
 
         # Load audio features (done once, cached)
         feat_path = getattr(self.opt, 'val_audio_feat_path', None)
-        if feat_path and os.path.exists(feat_path):
-            a_feat = torch.from_numpy(np.load(feat_path)).float()
-            if a_feat.ndim == 2:
-                a_feat = a_feat.unsqueeze(0)
-            self.a_data = {'a_feat': a_feat.to(device)}
-        else:
-            # Fallback: raw waveform via Wav2Vec
-            import librosa
-            from transformers import Wav2Vec2FeatureExtractor
-            preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-                self.opt.wav2vec_model_path, local_files_only=True
-            )
-            speech, sr = librosa.load(self.opt.val_aud_path, sr=self.opt.sampling_rate)
-            raw = preprocessor(speech, sampling_rate=sr, return_tensors='pt').input_values[0]
-            self.a_data = {'a': raw.unsqueeze(0).to(device)}
+        self.a_data = load_audio_conditioning(
+            self.opt,
+            audio_path=self.opt.val_aud_path,
+            audio_feat_path=feat_path,
+            device=device,
+            cache=self.audio_cache,
+        )
+        for key, value in list(self.a_data.items()):
+            if torch.is_tensor(value):
+                self.a_data[key] = value.to(device)
 
         self._ready = True
 

@@ -32,6 +32,10 @@ class BaseOptions():
 							help='Subdirectory under dataset_path for audio features (audio or audio_mimi)')
 		parser.add_argument('--audio_feat_dim', type=int, default=768,
 							help='Audio feature dimension (768 for Wav2Vec, 512 for Mimi)')
+		parser.add_argument('--moshi_repo', type=str, default=None,
+							help='Optional path to the local Moshi repo for on-the-fly Mimi extraction')
+		parser.add_argument('--mimi_hf_repo', type=str, default='kyutai/moshiko-pytorch-bf16',
+							help='Hugging Face repo used to load Mimi for on-the-fly wav->Mimi features')
 
 		# dropout
 		parser.add_argument('--audio_dropout_prob', default=0.1, type=float)
@@ -97,4 +101,3 @@ def load_options(opt, load_path):
 		_update = json.loads(f)
 	opt.update(_update)
 	return opt
-

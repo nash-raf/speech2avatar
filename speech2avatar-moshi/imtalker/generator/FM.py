@@ -22,7 +22,7 @@ class FMGenerator(nn.Module):
         self.audio_input_dim = getattr(opt, 'audio_feat_dim', 768 if opt.only_last_features else 12 * 768)
         
         # Components
-        self.audio_encoder = AudioEncoder(opt)
+        self.audio_encoder = AudioEncoder(opt) if self.audio_input_dim == 768 else None
         self.fmt = FlowMatchingTransformer(opt)
         
         # Projections

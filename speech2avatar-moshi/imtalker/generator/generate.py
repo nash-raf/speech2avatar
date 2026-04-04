@@ -10,13 +10,12 @@ import numpy as np
 import cv2
 import torch
 import torchvision
-import librosa
 import face_alignment
 from PIL import Image
 import torchvision.transforms as transforms
-from transformers import Wav2Vec2FeatureExtractor
 
 from generator.FM import FMGenerator
+from generator.audio_features import load_audio_conditioning
 from renderer.models import IMTRenderer
 from options.base_options import BaseOptions
 
@@ -33,11 +32,9 @@ class DataProcessor:
         self.fps = opt.fps
         self.sampling_rate = opt.sampling_rate
         self.input_size = opt.input_size
+        self.audio_cache = {}
 
         self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
-        self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-            opt.wav2vec_model_path, local_files_only=True
-        )
 
         self.transform = transforms.Compose([
             transforms.Resize((512, 512)),
@@ -85,23 +82,21 @@ class DataProcessor:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return Image.fromarray(img)
 
-    def default_aud_loader(self, path: str) -> torch.Tensor:
-        speech_array, sampling_rate = librosa.load(path, sr=self.sampling_rate)
-        return self.wav2vec_preprocessor(
-            speech_array,
-            sampling_rate=sampling_rate,
-            return_tensors='pt'
-        ).input_values[0]
-
-    def preprocess(self, ref_path: str, audio_path: str, crop: bool) -> dict:
+    def preprocess(self, ref_path: str, audio_path: str, crop: bool, audio_feat_path: str | None = None) -> dict:
         s = self.default_img_loader(ref_path)
         if crop:
             s = self.process_img(s)
         
         s_tensor = self.transform(s).unsqueeze(0)
-        a_tensor = self.default_aud_loader(audio_path).unsqueeze(0)
+        audio_data = load_audio_conditioning(
+            self.opt,
+            audio_path=audio_path,
+            audio_feat_path=audio_feat_path,
+            device=self.opt.rank,
+            cache=self.audio_cache,
+        )
 
-        return {'s': s_tensor, 'a': a_tensor, 'p': None, 'e': None}
+        return {'s': s_tensor, **audio_data, 'p': None, 'e': None}
 
 
 class InferenceAgent:
@@ -162,18 +157,12 @@ class InferenceAgent:
     @torch.no_grad()
     def run_inference(self, res_path, ref_path, aud_path, pose_path=None, gaze_path=None, **kwargs):
         audio_feat_path = kwargs.get('audio_feat_path', None)
-
-        if audio_feat_path and os.path.exists(audio_feat_path):
-            # Precomputed audio features path (Mimi or any offline features)
-            s = self.data_processor.default_img_loader(ref_path)
-            if kwargs.get('crop', False):
-                s = self.data_processor.process_img(s)
-            s_tensor = self.data_processor.transform(s).unsqueeze(0)
-            a_feat = torch.from_numpy(np.load(audio_feat_path)).float()
-            data = {'s': s_tensor, 'a_feat': a_feat}
-        else:
-            # Raw waveform path (Wav2Vec)
-            data = self.data_processor.preprocess(ref_path, aud_path, crop=kwargs.get('crop', False))
+        data = self.data_processor.preprocess(
+            ref_path,
+            aud_path,
+            crop=kwargs.get('crop', False),
+            audio_feat_path=audio_feat_path,
+        )
 
         if pose_path and os.path.exists(pose_path):
             data["pose"], data["cam"] = load_smirk_params(torch.load(pose_path))
@@ -283,6 +272,5 @@ if __name__ == '__main__':
                 process_item(agent, r_path, a_path, subdir, opt)
     else:
         print("Usage: Provide --ref_path & --aud_path OR --input_root")
-
 
 
