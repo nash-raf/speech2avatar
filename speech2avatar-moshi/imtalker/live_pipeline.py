@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ class LiveMoshiIMTalkerSession:
         self.a_cfg_scale = a_cfg_scale
         self.crop = crop
         self.chunk_frames = int(round(opt.wav2vec_sec * opt.fps))
+        self.chunk_sec = float(getattr(opt, "chunk_sec", 1.5))
         self.moshi_repo = moshi_repo
         self.mimi_hf_repo = mimi_hf_repo
 
@@ -72,21 +74,32 @@ class LiveMoshiIMTalkerSession:
         self.ref_x = None
         self.f_r = None
         self.g_r = None
+        self.idle_frame = None
         self.prepare_reference(ref_path)
 
         self.mimi = self._load_mimi()
         self.mimi_frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.chunk_raw_mimi_frames = max(1, int(round(self.chunk_frames * self.mimi.frame_rate / opt.fps)))
+        self.chunk_samples = max(self.mimi_frame_size, int(round(self.chunk_sec * self.mimi.sample_rate)))
 
         self.raw_pcm_buffer = np.zeros((0,), dtype=np.float32)
         self.raw_mimi_latent_buffer = torch.zeros((0, opt.audio_feat_dim), dtype=torch.float32)
-        self.fm_stream_state = None
-        self.chunk_index = 0
         self.frame_callback: Callable[[RenderedChunk], None] | None = None
         self.video_callback: Callable[[int, str], None] | None = None
+        self.segment_callback: Callable[[int, int, str], None] | None = None
+        self.turn_done_callback: Callable[[int], None] | None = None
 
+        self.fm_stream_state = None
+        self.chunk_index = 0
         self.turn_index = 0
-        self._pending_reply_pcm: list[torch.Tensor] = []
+        self.current_turn_id: int | None = None
+        self.current_segment_index = 0
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        self._render_queue: list[tuple[int, int, torch.Tensor]] = []
+        self._render_queue_event = asyncio.Event()
+        self._render_worker_task: asyncio.Task | None = None
+        self._reply_active = False
+        self._reply_done = False
 
     def _load_mimi(self):
         _ensure_moshi_importable(self.moshi_repo)
@@ -125,11 +138,10 @@ class LiveMoshiIMTalkerSession:
         if self.crop:
             image = self.data_processor.process_img(image)
         s_tensor = self.data_processor.transform(image).unsqueeze(0).to(self.device)
+        self.idle_frame = s_tensor[0].detach().cpu()
         self.f_r, self.g_r = self.renderer.dense_feature_encoder(s_tensor)
+        self.g_r = self.g_r
         self.ref_x = self.renderer.latent_token_encoder(s_tensor)
-
-    def _align_raw_mimi_to_imtalker_fps(self, latents: torch.Tensor) -> torch.Tensor:
-        return self._align_raw_mimi_to_target_frames(latents, self.chunk_frames)
 
     def _align_raw_mimi_to_target_frames(self, latents: torch.Tensor, target_frames: int) -> torch.Tensor:
         if latents.shape[0] == target_frames:
@@ -171,35 +183,6 @@ class LiveMoshiIMTalkerSession:
         return torch.cat(latents, dim=0)
 
     @torch.no_grad()
-    def _render_full_turn(self, latents: torch.Tensor) -> torch.Tensor:
-        if latents.ndim != 2:
-            raise ValueError(f"Expected [T, D] latents, got {tuple(latents.shape)}")
-
-        stream_state = None
-        all_frames = []
-        start = 0
-        total_raw = latents.shape[0]
-
-        while start < total_raw:
-            end = min(start + self.chunk_raw_mimi_frames, total_raw)
-            raw_chunk = latents[start:end]
-            target_frames = max(1, int(round(raw_chunk.shape[0] * self.opt.fps / self.mimi.frame_rate)))
-            aligned_chunk = self._align_raw_mimi_to_target_frames(raw_chunk, target_frames)
-            sample, stream_state = self.fm.sample(
-                {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
-                a_cfg_scale=self.a_cfg_scale,
-                nfe=self.nfe,
-                stream_state=stream_state,
-                return_state=True,
-            )
-            all_frames.append(self._decode_sample_to_frames(sample).detach().cpu())
-            start = end
-
-        if not all_frames:
-            raise RuntimeError("No frames rendered for reply turn")
-        return torch.cat(all_frames, dim=0)
-
-    @torch.no_grad()
     def _decode_sample_to_frames(self, sample: torch.Tensor) -> torch.Tensor:
         total_frames = sample.shape[1]
         ta_r = self.renderer.adapt(self.ref_x, self.g_r)
@@ -212,70 +195,104 @@ class LiveMoshiIMTalkerSession:
         return torch.stack(frames, dim=1).squeeze(0)
 
     @torch.no_grad()
-    def _render_next_ready_chunks(self) -> list[RenderedChunk]:
-        rendered = []
-        while self.raw_mimi_latent_buffer.shape[0] >= self.chunk_raw_mimi_frames:
-            raw_chunk = self.raw_mimi_latent_buffer[: self.chunk_raw_mimi_frames]
-            self.raw_mimi_latent_buffer = self.raw_mimi_latent_buffer[self.chunk_raw_mimi_frames :]
-            aligned_chunk = self._align_raw_mimi_to_imtalker_fps(raw_chunk)
-            sample, self.fm_stream_state = self.fm.sample(
-                {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
-                a_cfg_scale=self.a_cfg_scale,
-                nfe=self.nfe,
-                stream_state=self.fm_stream_state,
-                return_state=True,
-            )
-            frames = self._decode_sample_to_frames(sample)
-            result = RenderedChunk(
-                chunk_index=self.chunk_index,
-                frames=frames.detach().cpu(),
-                sample_latents=sample.detach().cpu(),
-                conditioning_latents=aligned_chunk.detach().cpu(),
-            )
-            self.chunk_index += 1
-            rendered.append(result)
-            if self.frame_callback is not None:
-                self.frame_callback(result)
-        return rendered
+    def _render_reply_chunk(self, pcm_chunk: torch.Tensor) -> RenderedChunk:
+        latents = self._encode_reply_pcm_to_latents(pcm_chunk)
+        if latents.shape[0] == 0:
+            raise RuntimeError("Cannot render empty reply chunk")
+
+        target_frames = max(1, int(round(latents.shape[0] * self.opt.fps / self.mimi.frame_rate)))
+        aligned_chunk = self._align_raw_mimi_to_target_frames(latents, target_frames)
+        stream_state = self.fm_stream_state
+        sample, next_state = self.fm.sample(
+            {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
+            a_cfg_scale=self.a_cfg_scale,
+            nfe=self.nfe,
+            stream_state=stream_state,
+            return_state=True,
+        )
+        self.fm_stream_state = next_state
+        frames = self._decode_sample_to_frames(sample)
+        result = RenderedChunk(
+            chunk_index=self.chunk_index,
+            frames=frames.detach().cpu(),
+            sample_latents=sample.detach().cpu(),
+            conditioning_latents=aligned_chunk.detach().cpu(),
+        )
+        self.chunk_index += 1
+        if self.frame_callback is not None:
+            self.frame_callback(result)
+        return result
+
+    def _ensure_turn_started(self) -> int:
+        if self._reply_active and self.current_turn_id is not None:
+            return self.current_turn_id
+        self.current_turn_id = self.turn_index
+        self.turn_index += 1
+        self.current_segment_index = 0
+        self.fm_stream_state = None
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        self._reply_active = True
+        self._reply_done = False
+        return self.current_turn_id
+
+    def _enqueue_ready_segments(self) -> None:
+        if not self._reply_active or self.current_turn_id is None:
+            return
+        while self._reply_pcm_buffer.numel() >= self.chunk_samples:
+            chunk = self._reply_pcm_buffer[: self.chunk_samples].clone()
+            self._reply_pcm_buffer = self._reply_pcm_buffer[self.chunk_samples :]
+            self._render_queue.append((self.current_turn_id, self.current_segment_index, chunk))
+            self.current_segment_index += 1
+        if self._render_queue:
+            self._render_queue_event.set()
+
+    async def _drain_render_queue(self) -> None:
+        while True:
+            if self._reply_done and not self._render_queue:
+                break
+            await self._render_queue_event.wait()
+            while self._render_queue:
+                turn_id, segment_index, pcm_chunk = self._render_queue.pop(0)
+
+                def _render_and_save() -> str:
+                    rendered = self._render_reply_chunk(pcm_chunk)
+                    output_dir = tempfile.mkdtemp(prefix=f"imtalker_segment_{turn_id:04d}_")
+                    output_path = os.path.join(output_dir, f"segment_{segment_index:04d}.mp4")
+                    return self.save_response_video(rendered.frames, pcm_chunk, output_path)
+
+                try:
+                    output_path = await asyncio.to_thread(_render_and_save)
+                except Exception as exc:
+                    print(f"[IMTalker] failed to render segment {turn_id:04d}/{segment_index:04d}: {exc}")
+                    continue
+                if self.segment_callback is not None:
+                    self.segment_callback(turn_id, segment_index, output_path)
+            self._render_queue_event.clear()
+            if self._reply_done and not self._render_queue:
+                break
+        self._render_worker_task = None
+        if self._reply_active and self.current_turn_id is not None and self.turn_done_callback is not None:
+            self.turn_done_callback(self.current_turn_id)
+        self._reply_active = False
+        self._reply_done = False
+        self.current_turn_id = None
+        self.current_segment_index = 0
+        self.fm_stream_state = None
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+
+    def _ensure_render_worker(self) -> None:
+        if self._render_worker_task is None or self._render_worker_task.done():
+            self._render_worker_task = asyncio.create_task(self._drain_render_queue())
 
     @torch.no_grad()
     def push_mimi_latents(self, latents: torch.Tensor | np.ndarray, *, aligned: bool = False) -> list[RenderedChunk]:
-        if isinstance(latents, np.ndarray):
-            latents = torch.from_numpy(latents)
-        latents = latents.detach().cpu().float()
-        if latents.ndim == 3:
-            latents = latents[0].transpose(0, 1).contiguous()
-        if aligned:
-            aligned_chunk = latents
-            sample, self.fm_stream_state = self.fm.sample(
-                {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
-                a_cfg_scale=self.a_cfg_scale,
-                nfe=self.nfe,
-                stream_state=self.fm_stream_state,
-                return_state=True,
-            )
-            frames = self._decode_sample_to_frames(sample)
-            result = RenderedChunk(
-                chunk_index=self.chunk_index,
-                frames=frames.detach().cpu(),
-                sample_latents=sample.detach().cpu(),
-                conditioning_latents=aligned_chunk.detach().cpu(),
-            )
-            self.chunk_index += 1
-            if self.frame_callback is not None:
-                self.frame_callback(result)
-            return [result]
-
-        self.raw_mimi_latent_buffer = torch.cat([self.raw_mimi_latent_buffer, latents], dim=0)
-        return self._render_next_ready_chunks()
+        del latents, aligned
+        return []
 
     @torch.no_grad()
     def push_mimi_codes(self, codes: torch.Tensor) -> list[RenderedChunk]:
-        if codes.ndim == 2:
-            codes = codes.unsqueeze(0)
-        codes = codes.to(self.device)
-        latents = self.mimi.decode_latent(codes)[0].transpose(0, 1).contiguous()
-        return self.push_mimi_latents(latents, aligned=False)
+        del codes
+        return []
 
     @torch.no_grad()
     def push_pcm_chunk(self, pcm: torch.Tensor | np.ndarray, sample_rate: int | None = None) -> list[RenderedChunk]:
@@ -292,21 +309,18 @@ class LiveMoshiIMTalkerSession:
             pcm_np = librosa.resample(pcm_np, orig_sr=sample_rate, target_sr=self.mimi.sample_rate)
 
         self.raw_pcm_buffer = np.concatenate([self.raw_pcm_buffer, pcm_np.astype(np.float32)])
-        latents = []
-        while self.raw_pcm_buffer.shape[0] >= self.mimi_frame_size:
-            frame = self.raw_pcm_buffer[: self.mimi_frame_size]
-            self.raw_pcm_buffer = self.raw_pcm_buffer[self.mimi_frame_size :]
-            wav = torch.from_numpy(frame).unsqueeze(0).unsqueeze(0).float().to(self.device)
-            latent = self.mimi.encode_to_latent(wav, quantize=False)[0].transpose(0, 1).contiguous().cpu()
-            latents.append(latent)
-        if not latents:
-            return []
-        return self.push_mimi_latents(torch.cat(latents, dim=0), aligned=False)
+        return []
 
     async def handle_moshi_output(self, tokens: torch.Tensor, pcm: torch.Tensor, latents: torch.Tensor) -> list[RenderedChunk]:
-        """Buffer Moshi reply PCM. finalize_pending_reply() is called explicitly on session close."""
+        """Buffer Moshi reply PCM and progressively publish AV segments."""
         del tokens, latents
-        self._pending_reply_pcm.append(pcm.detach().cpu())
+        turn_id = self._ensure_turn_started()
+        del turn_id
+        flat_pcm = pcm.detach().cpu().float().reshape(-1)
+        self._reply_pcm_buffer = torch.cat([self._reply_pcm_buffer, flat_pcm], dim=0)
+        self._enqueue_ready_segments()
+        if self._render_queue:
+            self._ensure_render_worker()
         return []
 
     async def handle_user_audio(self, latents: torch.Tensor) -> list[RenderedChunk]:
@@ -314,40 +328,46 @@ class LiveMoshiIMTalkerSession:
         return []
 
     async def finalize_pending_reply(self) -> str | None:
-        """Re-encode buffered PCM via Mimi encoder path (matches training distribution)
-        and render the full reply video. Called once when the session closes."""
-        if not self._pending_reply_pcm:
+        """Flush the final partial reply chunk and wait for segment publication."""
+        if not self._reply_active:
             return None
 
-        reply_pcm = torch.cat([chunk.reshape(-1) for chunk in self._pending_reply_pcm], dim=0)
-        self._pending_reply_pcm = []
+        if self.current_turn_id is None:
+            return None
 
-        turn_index = self.turn_index
-        self.turn_index += 1
-        output_dir = tempfile.mkdtemp(prefix="imtalker_reply_")
+        if self._reply_pcm_buffer.numel() > 0:
+            chunk = self._reply_pcm_buffer.clone()
+            self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+            self._render_queue.append((self.current_turn_id, self.current_segment_index, chunk))
+            self.current_segment_index += 1
+            self._render_queue_event.set()
 
-        def _render_and_save() -> str:
-            reply_latents = self._encode_reply_pcm_to_latents(reply_pcm)
-            frames = self._render_full_turn(reply_latents)
-            return self.save_response_video(frames, reply_pcm, os.path.join(output_dir, f"reply_{turn_index:04d}.mp4"))
-
-        output_path = await asyncio.to_thread(_render_and_save)
-        if self.video_callback is not None:
-            self.video_callback(turn_index, output_path)
-        return output_path
-
-    def save_chunk_video(self, rendered_chunk: RenderedChunk, output_path: str, audio_path: str | None = None) -> str:
-        frames = rendered_chunk.frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)
-        frames = (frames * 255).byte()
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_path = tmp.name
-        torchvision.io.write_video(tmp_path, frames, fps=self.opt.fps)
-        if audio_path:
-            os.system(f'ffmpeg -loglevel quiet -y -i "{tmp_path}" -i "{audio_path}" -c:v copy -c:a aac "{output_path}"')
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        self._reply_done = True
+        if self._render_queue:
+            self._ensure_render_worker()
+        if self._render_worker_task is not None:
+            self._render_queue_event.set()
+            await self._render_worker_task
         else:
-            os.replace(tmp_path, output_path)
+            if self.turn_done_callback is not None:
+                self.turn_done_callback(self.current_turn_id)
+            self._reply_active = False
+            self._reply_done = False
+            self.current_turn_id = None
+            self.current_segment_index = 0
+            self.fm_stream_state = None
+            self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        return None
+
+    def save_idle_video(self, output_path: str, duration_sec: float = 2.0) -> str:
+        if self.idle_frame is None:
+            raise RuntimeError("Reference image has not been prepared")
+        num_frames = max(1, int(round(duration_sec * self.opt.fps)))
+        frames = self.idle_frame.unsqueeze(0).repeat(num_frames, 1, 1, 1)
+        frames_hwc = frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)
+        frames_hwc = (frames_hwc * 255).byte()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        torchvision.io.write_video(output_path, frames_hwc, fps=self.opt.fps)
         return output_path
 
     def save_response_video(self, frames: torch.Tensor, pcm: torch.Tensor, output_path: str) -> str:
@@ -363,13 +383,28 @@ class LiveMoshiIMTalkerSession:
         torchvision.io.write_video(tmp_video_path, frames_hwc, fps=self.opt.fps)
         wavfile.write(tmp_wav_path, int(self.mimi.sample_rate), pcm.detach().cpu().float().numpy())
 
-        os.system(
-            f'ffmpeg -loglevel quiet -y -i "{tmp_video_path}" -i "{tmp_wav_path}" '
-            f'-c:v copy -c:a aac -shortest "{output_path}"'
-        )
+        mux_cmd = [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            tmp_video_path,
+            "-i",
+            tmp_wav_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            output_path,
+        ]
+        result = subprocess.run(mux_cmd, capture_output=True, text=True)
 
         if os.path.exists(tmp_video_path):
             os.remove(tmp_video_path)
         if os.path.exists(tmp_wav_path):
             os.remove(tmp_wav_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg mux failed: {result.stderr.strip()}")
         return output_path

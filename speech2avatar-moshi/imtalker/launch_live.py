@@ -1,211 +1,440 @@
 """
-launch_live.py — Moshi + IMTalker live bridge launcher.
-
-Usage:
-    python launch_live.py \
-        --ref_path assets/source_5.png \
-        --generator_path checkpoints/generator.ckpt \
-        --renderer_path checkpoints/renderer.ckpt \
-        --hf_repo kyutai/moshiko-pytorch-bf16 \
-        [--output_dir /tmp/live_chunks] \
-        [--host 0.0.0.0] [--port 8998]
+launch_live.py — combined AV Moshi + IMTalker launcher.
 
 Open in browser:
-    http://localhost:8998          — Moshi voice chat UI
-    http://localhost:8998/viewer   — IMTalker live face stream
+    http://localhost:8998/        — combined avatar page
+    http://localhost:8998/moshi   — hidden controller UI (debug/fallback)
 """
 
 from __future__ import annotations
 
-import asyncio
-import io
 import os
 import sys
 import tarfile
 import tempfile
+import threading
 from pathlib import Path
 
 import torch
-from PIL import Image
 
-# ── make moshi importable ──────────────────────────────────────────────────
 _MOSHI_REPO = Path(__file__).resolve().parent.parent / "moshi"
-_MOSHI_PKG  = _MOSHI_REPO / "moshi"
+_MOSHI_PKG = _MOSHI_REPO / "moshi"
 if _MOSHI_PKG.exists() and str(_MOSHI_PKG) not in sys.path:
     sys.path.insert(0, str(_MOSHI_PKG))
 
-# ── imtalker imports ───────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generator.options.base_options import BaseOptions
 from live_pipeline import LiveMoshiIMTalkerSession
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Options
-# ──────────────────────────────────────────────────────────────────────────
 class LaunchOptions(BaseOptions):
     def initialize(self, parser):
         super().initialize(parser)
         parser.set_defaults(audio_feat_dim=512, nfe=5, a_cfg_scale=1.0)
-        parser.add_argument("--ref_path",       required=True,  type=str)
-        parser.add_argument("--generator_path", required=True,  type=str)
-        parser.add_argument("--renderer_path",  required=True,  type=str)
-        parser.add_argument("--hf_repo",        default="kyutai/moshiko-pytorch-bf16", type=str)
-        parser.add_argument("--moshi_weight",   default=None,   type=str)
-        parser.add_argument("--mimi_weight",    default=None,   type=str)
-        parser.add_argument("--tokenizer",      default=None,   type=str)
-        parser.add_argument("--host",           default="0.0.0.0", type=str)
-        parser.add_argument("--port",           default=8998,   type=int)
-        parser.add_argument("--output_dir",     default=None,   type=str,
-                            help="Also save each chunk as chunk_NNNN.mp4 here")
-        parser.add_argument("--device",         default="cuda", type=str)
-        parser.add_argument("--crop",           action="store_true")
-        parser.add_argument("--max_sentences",  default=1, type=int,
+        parser.add_argument("--ref_path", required=True, type=str)
+        parser.add_argument("--generator_path", required=True, type=str)
+        parser.add_argument("--renderer_path", required=True, type=str)
+        parser.add_argument("--hf_repo", default="kyutai/moshiko-pytorch-bf16", type=str)
+        parser.add_argument("--moshi_weight", default=None, type=str)
+        parser.add_argument("--mimi_weight", default=None, type=str)
+        parser.add_argument("--tokenizer", default=None, type=str)
+        parser.add_argument("--host", default="0.0.0.0", type=str)
+        parser.add_argument("--port", default=8998, type=int)
+        parser.add_argument("--output_dir", default=None, type=str)
+        parser.add_argument("--device", default="cuda", type=str)
+        parser.add_argument("--crop", action="store_true")
+        parser.add_argument("--max_sentences", default=1, type=int,
                             help="Maximum number of sentences Moshi should speak per reply")
         parser.add_argument("--max_text_tokens", default=40, type=int,
                             help="Hard cap on Moshi text tokens per reply")
-        parser.add_argument("--jpeg_quality",   default=75,     type=int,
-                            help="JPEG quality for MJPEG stream (1-95)")
+        parser.add_argument("--chunk_sec", default=1.5, type=float,
+                            help="Live PCM accumulation window for progressive AV chunks")
         return parser
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# MJPEG frame broadcaster
-# ──────────────────────────────────────────────────────────────────────────
-class MJPEGBroadcaster:
-    """Holds a set of active streaming responses and pushes JPEG frames to all."""
-
-    def __init__(self, jpeg_quality: int = 75):
-        self.jpeg_quality = jpeg_quality
-        self._clients: set[asyncio.Queue] = set()
-        self._last_jpeg: bytes | None = None   # shown to clients that connect late
-
-    def _tensor_to_jpeg(self, frame_chw: torch.Tensor) -> bytes:
-        """frame_chw: [C, H, W] float in [-1, 1]."""
-        frame = frame_chw.clamp(-1, 1).add(1).mul(127.5).byte()
-        arr = frame.permute(1, 2, 0).cpu().numpy()        # [H, W, C]
-        img = Image.fromarray(arr, mode="RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=self.jpeg_quality)
-        return buf.getvalue()
-
-    def push_chunk(self, frames: torch.Tensor):
-        """frames: [T, C, H, W]. Pushes every frame to all connected clients."""
-        for t in range(frames.shape[0]):
-            jpeg = self._tensor_to_jpeg(frames[t])
-            self._last_jpeg = jpeg
-            dead = set()
-            for q in self._clients:
-                try:
-                    q.put_nowait(jpeg)
-                except asyncio.QueueFull:
-                    dead.add(q)   # slow client — drop it
-            self._clients -= dead
-
-    async def stream_response(self, request):
-        """aiohttp handler — streams MJPEG to one client."""
-        from aiohttp import web
-        resp = web.StreamResponse()
-        resp.content_type = "multipart/x-mixed-replace; boundary=frame"
-        await resp.prepare(request)
-
-        q: asyncio.Queue = asyncio.Queue(maxsize=30)
-        self._clients.add(q)
-
-        # Send the last known frame immediately so the browser isn't blank
-        if self._last_jpeg is not None:
-            await _write_jpeg(resp, self._last_jpeg)
-
-        try:
-            while True:
-                jpeg = await q.get()
-                await _write_jpeg(resp, jpeg)
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
-        finally:
-            self._clients.discard(q)
-        return resp
-
-
-async def _write_jpeg(resp, jpeg: bytes):
-    header = (
-        b"--frame\r\n"
-        b"Content-Type: image/jpeg\r\n"
-        b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
-    )
-    await resp.write(header + jpeg + b"\r\n")
-
-
-class LatestVideoStore:
+class AVSegmentStore:
     def __init__(self):
-        self.version = 0
-        self.turn_index = -1
-        self.latest_path: str | None = None
+        self._lock = threading.RLock()
+        self.idle_path: str | None = None
+        self.idle_version = 0
+        self.current_turn = -1
+        self.done = True
+        self.segments: dict[int, dict[int, str]] = {}
 
-    def update(self, turn_index: int, path: str):
-        self.turn_index = turn_index
-        self.latest_path = path
-        self.version += 1
+    def set_idle(self, path: str):
+        with self._lock:
+            self.idle_path = path
+            self.idle_version += 1
+
+    def start_turn_if_needed(self, turn_id: int):
+        with self._lock:
+            if self.current_turn != turn_id:
+                self.current_turn = turn_id
+                self.done = False
+                self.segments[turn_id] = {}
+
+    def add_segment(self, turn_id: int, segment_index: int, path: str):
+        with self._lock:
+            self.start_turn_if_needed(turn_id)
+            self.segments.setdefault(turn_id, {})[segment_index] = path
+
+    def finish_turn(self, turn_id: int):
+        with self._lock:
+            if self.current_turn == turn_id:
+                self.done = True
+
+    def state(self) -> dict:
+        with self._lock:
+            segment_indices = sorted(self.segments.get(self.current_turn, {}).keys())
+            return {
+                "idle_ready": self.idle_path is not None,
+                "idle_version": self.idle_version,
+                "turn_id": self.current_turn,
+                "done": self.done,
+                "segments": segment_indices,
+            }
+
+    def get_idle_path(self) -> str | None:
+        with self._lock:
+            return self.idle_path
+
+    def get_segment_path(self, turn_id: int, segment_index: int) -> str | None:
+        with self._lock:
+            return self.segments.get(turn_id, {}).get(segment_index)
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Viewer HTML (served at /viewer)
-# ──────────────────────────────────────────────────────────────────────────
 _VIEWER_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>IMTalker Live</title>
+  <title>Moshi + IMTalker</title>
   <style>
-    body  { margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh; }
-    .wrap { text-align:center; }
-    video { max-width:90vw; max-height:80vh; border-radius:8px; box-shadow:0 0 30px #000; background:#000; }
-    p     { color:#888; font-family:monospace; text-align:center; margin-top:12px; font-size:13px; }
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top, rgba(44,108,138,0.35), transparent 45%),
+        linear-gradient(180deg, #07090c 0%, #11161d 100%);
+      font-family: "IBM Plex Mono", monospace;
+      color: #d8e2ea;
+    }
+    .shell {
+      width: min(92vw, 980px);
+      display: grid;
+      gap: 16px;
+      justify-items: center;
+    }
+    .stage {
+      position: relative;
+      width: min(92vw, 760px);
+      aspect-ratio: 16 / 9;
+      border: 1px solid rgba(216,226,234,0.18);
+      border-radius: 18px;
+      background: #000;
+      overflow: hidden;
+      box-shadow: 0 30px 60px rgba(0,0,0,0.45);
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    .overlay {
+      position: absolute;
+      left: 16px;
+      right: 16px;
+      bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(10px);
+      font-size: 13px;
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    button {
+      border: 1px solid rgba(216,226,234,0.35);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.05);
+      color: #ecf2f7;
+      padding: 11px 18px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { background: rgba(255,255,255,0.12); }
+    .hidden-controller {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      left: -9999px;
+      top: -9999px;
+      opacity: 0;
+      pointer-events: none;
+    }
+    .hint {
+      font-size: 12px;
+      color: #9caab5;
+      text-align: center;
+      line-height: 1.5;
+      max-width: 720px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(216,226,234,0.18);
+      background: rgba(255,255,255,0.04);
+      font-size: 12px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #4fd38f;
+      box-shadow: 0 0 12px rgba(79,211,143,0.75);
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <video id="player" controls autoplay playsinline></video>
-    <p id="status">Waiting for a full reply video...</p>
-    <p>Turn-based IMTalker output &mdash; speak in Moshi, then wait for the rendered reply</p>
+  <div class="shell">
+    <div class="badge"><span class="dot"></span><span id="mode">Idle</span></div>
+    <div class="stage">
+      <video id="avatar" playsinline autoplay muted loop></video>
+      <div class="overlay">
+        <div id="status">Press Start to begin. The hidden controller handles microphone capture.</div>
+        <div class="controls">
+          <button id="startBtn">Start</button>
+          <button id="resetBtn">Reset</button>
+        </div>
+      </div>
+    </div>
+    <p class="hint">
+      Speak after starting. The browser will stay silent until an avatar AV chunk is ready, and then you will hear only the combined avatar playback.
+    </p>
+    <iframe id="controller" class="hidden-controller" allow="microphone; autoplay"></iframe>
   </div>
   <script>
-    const player = document.getElementById('player');
-    const status = document.getElementById('status');
-    let lastVersion = -1;
+    const avatar = document.getElementById('avatar');
+    const startBtn = document.getElementById('startBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const statusEl = document.getElementById('status');
+    const modeEl = document.getElementById('mode');
+    const controller = document.getElementById('controller');
 
-    async function pollLatest() {
+    let controllerStarted = false;
+    let idleVersion = -1;
+    let currentTurn = -1;
+    let lastSeenSegment = -1;
+    let turnDone = true;
+    let pending = [];
+    let loading = new Set();
+    let playing = false;
+    let controllerReloadScheduled = false;
+    let lastControllerResetTurn = -1;
+    let currentPlaybackUrl = null;
+
+    function setStatus(text, mode) {
+      statusEl.textContent = text;
+      if (mode) modeEl.textContent = mode;
+    }
+
+    function revokePlaybackUrlIfNeeded() {
+      if (currentPlaybackUrl && currentPlaybackUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(currentPlaybackUrl);
+      }
+      currentPlaybackUrl = null;
+    }
+
+    function clearPendingSegments() {
+      for (const item of pending) {
+        URL.revokeObjectURL(item.url);
+      }
+      pending = [];
+    }
+
+    async function ensureIdle(meta, opts) {
+      if (!meta.idle_ready) return;
+      const force = opts && opts.force;
+      // pollState runs often; do not replace an active reply segment with idle. playNext passes force
+      // when the reply queue is drained and we intentionally return to idle.
+      if (!force && avatar.dataset.mode === 'speaking') return;
+      if (idleVersion === meta.idle_version && avatar.dataset.mode === 'idle') return;
+      idleVersion = meta.idle_version;
+      avatar.pause();
+      revokePlaybackUrlIfNeeded();
+      avatar.src = `/api/idle_video?v=${meta.idle_version}`;
+      currentPlaybackUrl = avatar.src;
+      avatar.muted = true;
+      avatar.loop = true;
+      avatar.dataset.mode = 'idle';
+      try { await avatar.play(); } catch (_) {}
+      setStatus('Listening for your next turn…', 'Idle');
+    }
+
+    async function fetchSegment(turnId, segmentIndex) {
+      const key = `${turnId}:${segmentIndex}`;
+      if (loading.has(key)) return;
+      loading.add(key);
       try {
-        const res = await fetch('/api/latest_video_meta?' + Date.now(), { cache: 'no-store' });
+        const res = await fetch(`/api/segment/${turnId}/${segmentIndex}?t=${Date.now()}`, { cache: 'no-store' });
         if (!res.ok) return;
-        const meta = await res.json();
-        if (!meta.ready) {
-          status.textContent = 'Waiting for a full reply video...';
+        const blob = await res.blob();
+        pending.push({ turnId, segmentIndex, url: URL.createObjectURL(blob) });
+        pending.sort((a, b) => a.segmentIndex - b.segmentIndex);
+      } finally {
+        loading.delete(key);
+      }
+      // Kick playback after fetch completes (and loading count decremented)
+      if (!playing) playNext();
+    }
+
+    async function playNext() {
+      if (!pending.length) {
+        // Don't declare turn complete while segment fetches are still in flight
+        if (loading.size > 0) {
+          playing = false;
+          console.log('[avatar] playNext: pending empty but', loading.size, 'fetches in flight — waiting');
           return;
         }
-        status.textContent = `Latest turn: ${meta.turn_index}`;
-        if (meta.version !== lastVersion) {
-          lastVersion = meta.version;
-          player.src = `/api/latest_video?v=${meta.version}`;
-          player.load();
-          player.play().catch(() => {});
+        playing = false;
+        if (turnDone) {
+          console.log('[avatar] playNext: all segments played, turn done — returning to idle');
+          await ensureIdle({ idle_ready: true, idle_version: idleVersion }, { force: true });
+          maybeReloadController();
+        }
+        return;
+      }
+      const next = pending.shift();
+      playing = true;
+      avatar.pause();
+      revokePlaybackUrlIfNeeded();
+      avatar.src = next.url;
+      currentPlaybackUrl = next.url;
+      avatar.muted = false;
+      avatar.loop = false;
+      avatar.dataset.mode = 'speaking';
+      console.log('[avatar] playNext: playing segment', next.segmentIndex, '| pending:', pending.length, '| loading:', loading.size);
+      setStatus(`Playing reply chunk ${next.segmentIndex + 1}`, 'Speaking');
+      try { await avatar.play(); } catch (_) {}
+    }
+
+    function startController() {
+      if (controllerStarted) return;
+      controllerStarted = true;
+      controller.src = `/moshi#/?embed=1&ts=${Date.now()}`;
+      setStatus('Controller connected. Speak into your mic.', 'Listening');
+    }
+
+    function maybeReloadController() {
+      if (!controllerStarted || controllerReloadScheduled) return;
+      if (currentTurn < 0 || lastControllerResetTurn === currentTurn) return;
+      controllerReloadScheduled = true;
+      lastControllerResetTurn = currentTurn;
+      setTimeout(() => {
+        controllerReloadScheduled = false;
+        controller.src = `/moshi#/?embed=1&ts=${Date.now()}`;
+        setStatus('Ready for another turn. Speak again.', 'Listening');
+      }, 900);
+    }
+
+    async function pollState() {
+      try {
+        const res = await fetch(`/api/stream_state?ts=${Date.now()}`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const meta = await res.json();
+        // Only sync idle from polling when not actively playing a segment (see ensureIdle speaking guard).
+        if (!playing) {
+          await ensureIdle(meta);
+        }
+        if (meta.turn_id !== currentTurn) {
+          clearPendingSegments();
+          playing = false;
+          currentTurn = meta.turn_id;
+          lastSeenSegment = -1;
+          turnDone = meta.done;
+        } else {
+          turnDone = meta.done;
+        }
+        if (meta.turn_id >= 0) {
+          for (const segmentIndex of meta.segments) {
+            if (segmentIndex > lastSeenSegment) {
+              lastSeenSegment = segmentIndex;
+              fetchSegment(meta.turn_id, segmentIndex);
+            }
+          }
+        }
+        if (!playing && pending.length) {
+          playNext();
+        }
+        if (!playing && turnDone && currentTurn >= 0 && !pending.length && !loading.size) {
+          maybeReloadController();
         }
       } catch (_) {}
     }
 
-    setInterval(pollLatest, 1000);
-    pollLatest();
+    avatar.addEventListener('ended', () => {
+      playNext();
+    });
+
+    async function primeMicrophoneFromParentGesture() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+        console.info('[avatar] Microphone permission primed on parent (same origin as iframe).');
+      } catch (e) {
+        console.warn('[avatar] Parent could not acquire microphone — iframe auto-connect may fail:', e);
+      }
+    }
+
+    function notifyIframeMicPrimed() {
+      try {
+        controller.contentWindow?.postMessage({ type: 'moshi-mic-primed' }, '*');
+      } catch (_) {}
+    }
+
+    controller.addEventListener('load', () => notifyIframeMicPrimed());
+
+    startBtn.addEventListener('click', async () => {
+      await primeMicrophoneFromParentGesture();
+      startController();
+      await pollState();
+    });
+
+    resetBtn.addEventListener('click', async () => {
+      clearPendingSegments();
+      revokePlaybackUrlIfNeeded();
+      currentTurn = -1;
+      lastSeenSegment = -1;
+      lastControllerResetTurn = -1;
+      playing = false;
+      controllerStarted = false;
+      controller.src = 'about:blank';
+      await ensureIdle({ idle_ready: true, idle_version }, { force: true });
+      setStatus('Reset complete. Press Start to begin again.', 'Idle');
+    });
+
+    setInterval(pollState, 500);
+    pollState();
   </script>
 </body>
 </html>
 """
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Build session + moshi state
-# ──────────────────────────────────────────────────────────────────────────
-def build_imtalker_session(opt, latest_video: LatestVideoStore) -> LiveMoshiIMTalkerSession:
+def build_imtalker_session(opt, segments: AVSegmentStore) -> LiveMoshiIMTalkerSession:
     print("[launch] Loading IMTalker session…")
     session = LiveMoshiIMTalkerSession(
         opt,
@@ -219,16 +448,22 @@ def build_imtalker_session(opt, latest_video: LatestVideoStore) -> LiveMoshiIMTa
         mimi_hf_repo=opt.hf_repo,
     )
 
-    output_dir = opt.output_dir or os.path.join(tempfile.gettempdir(), "imtalker_turn_videos")
+    output_dir = opt.output_dir or os.path.join(tempfile.gettempdir(), "imtalker_stream_segments")
     os.makedirs(output_dir, exist_ok=True)
+    idle_path = os.path.join(output_dir, "idle_loop.mp4")
+    session.save_idle_video(idle_path)
+    segments.set_idle(idle_path)
 
-    def _on_video(turn_index: int, path: str):
-        latest_path = os.path.join(output_dir, "latest_reply.mp4")
-        os.replace(path, latest_path)
-        latest_video.update(turn_index, latest_path)
-        print(f"[IMTalker] turn {turn_index:04d} rendered → {latest_path}")
+    def _on_segment(turn_id: int, segment_index: int, path: str):
+        segments.add_segment(turn_id, segment_index, path)
+        print(f"[IMTalker] turn {turn_id:04d} segment {segment_index:04d} ready → {path}")
 
-    session.video_callback = _on_video
+    def _on_turn_done(turn_id: int):
+        segments.finish_turn(turn_id)
+        print(f"[IMTalker] turn {turn_id:04d} finished")
+
+    session.segment_callback = _on_segment
+    session.turn_done_callback = _on_turn_done
     print("[launch] IMTalker session ready.")
     return session
 
@@ -244,9 +479,10 @@ def build_moshi_state(opt, session: LiveMoshiIMTalkerSession):
         opt.hf_repo, opt.moshi_weight, opt.mimi_weight, opt.tokenizer,
     )
 
-    mimi = session.mimi   # reuse — no double load
     text_tokenizer = checkpoint_info.get_text_tokenizer()
 
+    print("[launch] Loading Moshi Mimi…")
+    mimi = checkpoint_info.get_mimi(device=opt.device)
     print("[launch] Loading Moshi LM…")
     lm = checkpoint_info.get_moshi(device=opt.device, dtype=torch.bfloat16)
 
@@ -261,6 +497,7 @@ def build_moshi_state(opt, session: LiveMoshiIMTalkerSession):
         user_audio_handler=session.handle_user_audio,
         max_sentences=opt.max_sentences,
         max_text_tokens=opt.max_text_tokens,
+        send_audio_to_client=False,
         **checkpoint_info.lm_gen_config,
     )
     print("[launch] Warming up Moshi…")
@@ -268,9 +505,6 @@ def build_moshi_state(opt, session: LiveMoshiIMTalkerSession):
     return state
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────
 def main():
     from aiohttp import web
     from huggingface_hub import hf_hub_download
@@ -278,46 +512,47 @@ def main():
     opt = LaunchOptions().parse()
     opt.rank = opt.device
 
-    latest_video = LatestVideoStore()
-    session     = build_imtalker_session(opt, latest_video)
-    state       = build_moshi_state(opt, session)
+    segments = AVSegmentStore()
+    session = build_imtalker_session(opt, segments)
+    state = build_moshi_state(opt, session)
 
-    # ── Moshi web UI static bundle ─────────────────────────────────────────
-    dist_tgz = Path(hf_hub_download("kyutai/moshi-artifacts", "dist.tgz"))
-    dist = dist_tgz.parent / "dist"
-    if not dist.exists():
-        with tarfile.open(dist_tgz, "r:gz") as tar:
-            tar.extractall(path=dist_tgz.parent)
-    static_path = str(dist)
+    # Use locally-built Moshi client (built with base="/moshi/" and hash routing)
+    _local_dist = Path(__file__).resolve().parent.parent / "moshi" / "client" / "dist"
+    if _local_dist.exists():
+        static_path = str(_local_dist)
+        print(f"[launch] Using local Moshi client build: {static_path}")
+    else:
+        dist_tgz = Path(hf_hub_download("kyutai/moshi-artifacts", "dist.tgz"))
+        dist = dist_tgz.parent / "dist"
+        if not dist.exists():
+            with tarfile.open(dist_tgz, "r:gz") as tar:
+                tar.extractall(path=dist_tgz.parent)
+        static_path = str(dist)
+        print(f"[launch] WARNING: Using HF pre-built bundle (no hash routing fix)")
 
-    # ── aiohttp routes ─────────────────────────────────────────────────────
     app = web.Application()
-
-    # Moshi voice chat
     app.router.add_get("/api/chat", state.handle_chat)
-    app.router.add_get("/", lambda r: web.FileResponse(os.path.join(static_path, "index.html")))
-    app.router.add_static("/assets", path=os.path.join(static_path, "assets"),
+    app.router.add_get("/api/stream_state", lambda r: web.json_response(segments.state()))
+    app.router.add_get(
+        "/api/idle_video",
+        lambda r: web.FileResponse(segments.get_idle_path()) if segments.get_idle_path() else web.Response(status=404),
+    )
+    app.router.add_get(
+        r"/api/segment/{turn:\d+}/{segment:\d+}",
+        lambda r: web.FileResponse(
+            segments.get_segment_path(int(r.match_info["turn"]), int(r.match_info["segment"]))
+        ) if segments.get_segment_path(int(r.match_info["turn"]), int(r.match_info["segment"])) else web.Response(status=404),
+    )
+
+    app.router.add_get("/", lambda r: web.Response(text=_VIEWER_HTML, content_type="text/html"))
+    app.router.add_get("/viewer", lambda r: web.Response(text=_VIEWER_HTML, content_type="text/html"))
+    app.router.add_get("/moshi", lambda r: web.FileResponse(os.path.join(static_path, "index.html")))
+    app.router.add_get("/moshi/", lambda r: web.FileResponse(os.path.join(static_path, "index.html")))
+    app.router.add_static("/moshi/assets", path=os.path.join(static_path, "assets"),
                           follow_symlinks=True, name="moshi_static")
 
-    # IMTalker full response video
-    app.router.add_get(
-        "/api/latest_video_meta",
-        lambda r: web.json_response(
-            {
-                "ready": latest_video.latest_path is not None,
-                "version": latest_video.version,
-                "turn_index": latest_video.turn_index,
-            }
-        ),
-    )
-    app.router.add_get(
-        "/api/latest_video",
-        lambda r: web.FileResponse(latest_video.latest_path) if latest_video.latest_path else web.Response(status=404),
-    )
-    app.router.add_get("/viewer", lambda r: web.Response(text=_VIEWER_HTML, content_type="text/html"))
-
-    print(f"\n[launch] Moshi chat  → http://localhost:{opt.port}/")
-    print(f"[launch] Face stream → http://localhost:{opt.port}/viewer\n")
+    print(f"\n[launch] Combined avatar → http://localhost:{opt.port}/")
+    print(f"[launch] Hidden Moshi UI  → http://localhost:{opt.port}/moshi\n")
     web.run_app(app, host=opt.host, port=opt.port)
 
 
