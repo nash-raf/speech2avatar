@@ -50,7 +50,6 @@ class LiveMoshiIMTalkerSession:
         crop: bool = True,
         nfe: int = 2,
         a_cfg_scale: float = 1.0,
-        reply_finalize_delay: float = 2.0,
         moshi_repo: str | None = None,
         mimi_hf_repo: str = "kyutai/moshiko-pytorch-bf16",
     ):
@@ -76,7 +75,6 @@ class LiveMoshiIMTalkerSession:
         self.prepare_reference(ref_path)
 
         self.mimi = self._load_mimi()
-        self._mimi_streaming_initialized = False
         self.mimi_frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.chunk_raw_mimi_frames = max(1, int(round(self.chunk_frames * self.mimi.frame_rate / opt.fps)))
 
@@ -88,11 +86,7 @@ class LiveMoshiIMTalkerSession:
         self.video_callback: Callable[[int, str], None] | None = None
 
         self.turn_index = 0
-        self.turn_finalize_delay_s = reply_finalize_delay
-        self._pending_reply_latents: list[torch.Tensor] = []
         self._pending_reply_pcm: list[torch.Tensor] = []
-        self._reply_finalize_task: asyncio.Task | None = None
-        self._reply_generation = 0
 
     def _load_mimi(self):
         _ensure_moshi_importable(self.moshi_repo)
@@ -147,6 +141,34 @@ class LiveMoshiIMTalkerSession:
             align_corners=True,
         )[0].transpose(0, 1).contiguous()
         return aligned
+
+    def _ensure_mimi_streaming(self) -> None:
+        if getattr(self.mimi, "_streaming_state", None) is None:
+            self.mimi.streaming_forever(1)
+        self.mimi.reset_streaming()
+
+    @torch.no_grad()
+    def _encode_reply_pcm_to_latents(self, pcm: torch.Tensor) -> torch.Tensor:
+        pcm = pcm.detach().cpu().float().reshape(-1)
+        if pcm.numel() == 0:
+            return torch.zeros((0, self.opt.audio_feat_dim), dtype=torch.float32)
+
+        self._ensure_mimi_streaming()
+
+        latents = []
+        start = 0
+        total = pcm.numel()
+        while start < total:
+            end = min(start + self.mimi_frame_size, total)
+            frame = pcm[start:end]
+            if frame.numel() < self.mimi_frame_size:
+                frame = F.pad(frame, (0, self.mimi_frame_size - frame.numel()))
+            wav = frame.unsqueeze(0).unsqueeze(0).to(self.device)
+            latent = self.mimi.encode_to_latent(wav, quantize=False)[0].transpose(0, 1).contiguous().cpu()
+            latents.append(latent)
+            start = end
+
+        return torch.cat(latents, dim=0)
 
     @torch.no_grad()
     def _render_full_turn(self, latents: torch.Tensor) -> torch.Tensor:
@@ -257,10 +279,7 @@ class LiveMoshiIMTalkerSession:
 
     @torch.no_grad()
     def push_pcm_chunk(self, pcm: torch.Tensor | np.ndarray, sample_rate: int | None = None) -> list[RenderedChunk]:
-        if not self._mimi_streaming_initialized:
-            self.mimi.streaming_forever(1)
-            self.mimi.reset_streaming()
-            self._mimi_streaming_initialized = True
+        self._ensure_mimi_streaming()
         if isinstance(pcm, torch.Tensor):
             pcm_np = pcm.detach().cpu().float().numpy()
         else:
@@ -285,31 +304,22 @@ class LiveMoshiIMTalkerSession:
         return self.push_mimi_latents(torch.cat(latents, dim=0), aligned=False)
 
     async def handle_moshi_output(self, tokens: torch.Tensor, pcm: torch.Tensor, latents: torch.Tensor) -> list[RenderedChunk]:
-        del tokens
-        self._pending_reply_latents.append(latents[0].transpose(0, 1).contiguous().detach().cpu())
+        """Buffer Moshi reply PCM. finalize_pending_reply() is called explicitly on session close."""
+        del tokens, latents
         self._pending_reply_pcm.append(pcm.detach().cpu())
-        self._reply_generation += 1
-        if self._reply_finalize_task is not None and not self._reply_finalize_task.done():
-            self._reply_finalize_task.cancel()
-        self._reply_finalize_task = asyncio.create_task(self._finalize_reply_after_silence(self._reply_generation))
         return []
 
     async def handle_user_audio(self, latents: torch.Tensor) -> list[RenderedChunk]:
         del latents
         return []
 
-    async def _finalize_reply_after_silence(self, generation: int) -> None:
-        try:
-            await asyncio.sleep(self.turn_finalize_delay_s)
-        except asyncio.CancelledError:
-            return
+    async def finalize_pending_reply(self) -> str | None:
+        """Re-encode buffered PCM via Mimi encoder path (matches training distribution)
+        and render the full reply video. Called once when the session closes."""
+        if not self._pending_reply_pcm:
+            return None
 
-        if generation != self._reply_generation or not self._pending_reply_latents:
-            return
-
-        reply_latents = torch.cat(self._pending_reply_latents, dim=0)
         reply_pcm = torch.cat([chunk.reshape(-1) for chunk in self._pending_reply_pcm], dim=0)
-        self._pending_reply_latents = []
         self._pending_reply_pcm = []
 
         turn_index = self.turn_index
@@ -317,12 +327,14 @@ class LiveMoshiIMTalkerSession:
         output_dir = tempfile.mkdtemp(prefix="imtalker_reply_")
 
         def _render_and_save() -> str:
+            reply_latents = self._encode_reply_pcm_to_latents(reply_pcm)
             frames = self._render_full_turn(reply_latents)
             return self.save_response_video(frames, reply_pcm, os.path.join(output_dir, f"reply_{turn_index:04d}.mp4"))
 
         output_path = await asyncio.to_thread(_render_and_save)
         if self.video_callback is not None:
             self.video_callback(turn_index, output_path)
+        return output_path
 
     def save_chunk_video(self, rendered_chunk: RenderedChunk, output_path: str, audio_path: str | None = None) -> str:
         frames = rendered_chunk.frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)

@@ -64,12 +64,6 @@ class LaunchOptions(BaseOptions):
                             help="Maximum number of sentences Moshi should speak per reply")
         parser.add_argument("--max_text_tokens", default=40, type=int,
                             help="Hard cap on Moshi text tokens per reply")
-        parser.add_argument("--reply_finalize_delay", default=1.5, type=float,
-                            help="Seconds of reply silence before rendering a full talking-head video")
-        parser.add_argument("--vad_threshold",  default=0.01, type=float,
-                            help="RMS energy threshold for speech detection")
-        parser.add_argument("--vad_silence_frames", default=15, type=int,
-                            help="Frames of silence before user is considered done (~1.2s at 12.5Hz)")
         parser.add_argument("--jpeg_quality",   default=75,     type=int,
                             help="JPEG quality for MJPEG stream (1-95)")
         return parser
@@ -221,7 +215,6 @@ def build_imtalker_session(opt, latest_video: LatestVideoStore) -> LiveMoshiIMTa
         crop=opt.crop,
         nfe=opt.nfe,
         a_cfg_scale=opt.a_cfg_scale,
-        reply_finalize_delay=opt.reply_finalize_delay,
         moshi_repo=str(_MOSHI_REPO),
         mimi_hf_repo=opt.hf_repo,
     )
@@ -268,8 +261,6 @@ def build_moshi_state(opt, session: LiveMoshiIMTalkerSession):
         user_audio_handler=session.handle_user_audio,
         max_sentences=opt.max_sentences,
         max_text_tokens=opt.max_text_tokens,
-        vad_threshold=opt.vad_threshold,
-        vad_silence_frames=opt.vad_silence_frames,
         **checkpoint_info.lm_gen_config,
     )
     print("[launch] Warming up Moshi…")
