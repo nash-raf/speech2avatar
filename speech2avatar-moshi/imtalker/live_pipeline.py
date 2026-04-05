@@ -78,6 +78,7 @@ class LiveMoshiIMTalkerSession:
         self.idle_frame = None
         self.prepare_reference(ref_path)
 
+        self._render_stream = torch.cuda.Stream(self.device)
         self.mimi = self._load_mimi()
         self.mimi_frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.chunk_raw_mimi_frames = max(1, int(round(self.chunk_frames * self.mimi.frame_rate / opt.fps)))
@@ -185,46 +186,64 @@ class LiveMoshiIMTalkerSession:
 
     @torch.no_grad()
     def _decode_sample_to_frames(self, sample: torch.Tensor) -> torch.Tensor:
-        total_frames = sample.shape[1]
-        ta_r = self.renderer.adapt(self.ref_x, self.g_r)
-        m_r = self.renderer.latent_token_decoder(ta_r)
-        frames = []
-        for frame_idx in range(total_frames):
-            ta_c = self.renderer.adapt(sample[:, frame_idx, ...], self.g_r)
-            m_c = self.renderer.latent_token_decoder(ta_c)
-            frames.append(self.renderer.decode(m_c, m_r, self.f_r))
-        return torch.stack(frames, dim=1).squeeze(0)
+        total_frames = sample.shape[1]  # sample: [1, T, 32]
+        batch_size = getattr(self, '_render_batch_size', 4)  # mini-batch to avoid OOM
+
+        # Reference motion maps (computed once, same for every frame)
+        ta_r = self.renderer.adapt(self.ref_x, self.g_r)          # [1, 32]
+        m_r = self.renderer.latent_token_decoder(ta_r)             # tuple of 4 spatial maps
+
+        # --- Batch adapt + latent_token_decoder for ALL frames at once (cheap MLPs) ---
+        g_r_exp = self.g_r.expand(total_frames, -1)                # [T, 512]
+        sample_flat = sample.squeeze(0)                            # [T, 32]
+        ta_c_all = self.renderer.adapt(sample_flat, g_r_exp)       # [T, 32]
+        m_c_all = self.renderer.latent_token_decoder(ta_c_all)     # tuple of 4: each [T, C, H, W]
+
+        # --- Mini-batched decode (CrossAttention + SynthesisNetwork) ---
+        all_frames = []
+        for start in range(0, total_frames, batch_size):
+            end = min(start + batch_size, total_frames)
+            bs = end - start
+            m_c_batch = tuple(m[start:end] for m in m_c_all)
+            m_r_batch = tuple(m.expand(bs, -1, -1, -1) for m in m_r)
+            f_r_batch = [f.expand(bs, -1, -1, -1) for f in self.f_r]
+            out = self.renderer.decode(m_c_batch, m_r_batch, f_r_batch)
+            all_frames.append(out)
+
+        return torch.cat(all_frames, dim=0)  # [T, 3, H, W]
 
     @torch.no_grad()
     def _render_reply_chunk(self, pcm_chunk: torch.Tensor) -> RenderedChunk:
         t_chunk_start = time.perf_counter()
 
-        t0 = time.perf_counter()
-        latents = self._encode_reply_pcm_to_latents(pcm_chunk)
-        t_mimi = time.perf_counter() - t0
-        if latents.shape[0] == 0:
-            raise RuntimeError("Cannot render empty reply chunk")
+        # Run all GPU work on a dedicated stream to avoid conflicting with Moshi's CUDA Graphs
+        with torch.cuda.stream(self._render_stream):
+            t0 = time.perf_counter()
+            latents = self._encode_reply_pcm_to_latents(pcm_chunk)
+            t_mimi = time.perf_counter() - t0
+            if latents.shape[0] == 0:
+                raise RuntimeError("Cannot render empty reply chunk")
 
-        target_frames = max(1, int(round(latents.shape[0] * self.opt.fps / self.mimi.frame_rate)))
-        aligned_chunk = self._align_raw_mimi_to_target_frames(latents, target_frames)
+            target_frames = max(1, int(round(latents.shape[0] * self.opt.fps / self.mimi.frame_rate)))
+            aligned_chunk = self._align_raw_mimi_to_target_frames(latents, target_frames)
 
-        t0 = time.perf_counter()
-        stream_state = self.fm_stream_state
-        sample, next_state = self.fm.sample(
-            {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
-            a_cfg_scale=self.a_cfg_scale,
-            nfe=self.nfe,
-            stream_state=stream_state,
-            return_state=True,
-        )
-        torch.cuda.synchronize()
-        t_generator = time.perf_counter() - t0
-        self.fm_stream_state = next_state
+            t0 = time.perf_counter()
+            stream_state = self.fm_stream_state
+            sample, next_state = self.fm.sample(
+                {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
+                a_cfg_scale=self.a_cfg_scale,
+                nfe=self.nfe,
+                stream_state=stream_state,
+                return_state=True,
+            )
+            self._render_stream.synchronize()
+            t_generator = time.perf_counter() - t0
+            self.fm_stream_state = next_state
 
-        t0 = time.perf_counter()
-        frames = self._decode_sample_to_frames(sample)
-        torch.cuda.synchronize()
-        t_renderer = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            frames = self._decode_sample_to_frames(sample)
+            self._render_stream.synchronize()
+            t_renderer = time.perf_counter() - t0
 
         result = RenderedChunk(
             chunk_index=self.chunk_index,
