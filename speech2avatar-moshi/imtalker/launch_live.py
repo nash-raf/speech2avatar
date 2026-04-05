@@ -22,6 +22,7 @@ import io
 import os
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 
 import torch
@@ -45,6 +46,7 @@ from live_pipeline import LiveMoshiIMTalkerSession
 class LaunchOptions(BaseOptions):
     def initialize(self, parser):
         super().initialize(parser)
+        parser.set_defaults(audio_feat_dim=512, nfe=5, a_cfg_scale=1.0)
         parser.add_argument("--ref_path",       required=True,  type=str)
         parser.add_argument("--generator_path", required=True,  type=str)
         parser.add_argument("--renderer_path",  required=True,  type=str)
@@ -54,12 +56,20 @@ class LaunchOptions(BaseOptions):
         parser.add_argument("--tokenizer",      default=None,   type=str)
         parser.add_argument("--host",           default="0.0.0.0", type=str)
         parser.add_argument("--port",           default=8998,   type=int)
-        parser.add_argument("--nfe",            default=5,      type=int)
-        parser.add_argument("--a_cfg_scale",    default=1.0,    type=float)
         parser.add_argument("--output_dir",     default=None,   type=str,
                             help="Also save each chunk as chunk_NNNN.mp4 here")
         parser.add_argument("--device",         default="cuda", type=str)
         parser.add_argument("--crop",           action="store_true")
+        parser.add_argument("--max_sentences",  default=1, type=int,
+                            help="Maximum number of sentences Moshi should speak per reply")
+        parser.add_argument("--max_text_tokens", default=40, type=int,
+                            help="Hard cap on Moshi text tokens per reply")
+        parser.add_argument("--reply_finalize_delay", default=1.5, type=float,
+                            help="Seconds of reply silence before rendering a full talking-head video")
+        parser.add_argument("--vad_threshold",  default=0.01, type=float,
+                            help="RMS energy threshold for speech detection")
+        parser.add_argument("--vad_silence_frames", default=15, type=int,
+                            help="Frames of silence before user is considered done (~1.2s at 12.5Hz)")
         parser.add_argument("--jpeg_quality",   default=75,     type=int,
                             help="JPEG quality for MJPEG stream (1-95)")
         return parser
@@ -132,6 +142,18 @@ async def _write_jpeg(resp, jpeg: bytes):
     await resp.write(header + jpeg + b"\r\n")
 
 
+class LatestVideoStore:
+    def __init__(self):
+        self.version = 0
+        self.turn_index = -1
+        self.latest_path: str | None = None
+
+    def update(self, turn_index: int, path: str):
+        self.turn_index = turn_index
+        self.latest_path = path
+        self.version += 1
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Viewer HTML (served at /viewer)
 # ──────────────────────────────────────────────────────────────────────────
@@ -143,19 +165,43 @@ _VIEWER_HTML = """\
   <title>IMTalker Live</title>
   <style>
     body  { margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh; }
-    img   { max-width:90vw; max-height:90vh; border-radius:8px; box-shadow:0 0 30px #000; }
+    .wrap { text-align:center; }
+    video { max-width:90vw; max-height:80vh; border-radius:8px; box-shadow:0 0 30px #000; background:#000; }
     p     { color:#888; font-family:monospace; text-align:center; margin-top:12px; font-size:13px; }
   </style>
 </head>
 <body>
-  <div>
-    <img id="feed" src="/api/video_feed" alt="Waiting for IMTalker…">
-    <p>IMTalker live output &mdash; speak into Moshi to animate the face</p>
+  <div class="wrap">
+    <video id="player" controls autoplay playsinline></video>
+    <p id="status">Waiting for a full reply video...</p>
+    <p>Turn-based IMTalker output &mdash; speak in Moshi, then wait for the rendered reply</p>
   </div>
   <script>
-    // If MJPEG drops, auto-reconnect after 2 s
-    const img = document.getElementById('feed');
-    img.onerror = () => setTimeout(() => { img.src = '/api/video_feed?' + Date.now(); }, 2000);
+    const player = document.getElementById('player');
+    const status = document.getElementById('status');
+    let lastVersion = -1;
+
+    async function pollLatest() {
+      try {
+        const res = await fetch('/api/latest_video_meta?' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) return;
+        const meta = await res.json();
+        if (!meta.ready) {
+          status.textContent = 'Waiting for a full reply video...';
+          return;
+        }
+        status.textContent = `Latest turn: ${meta.turn_index}`;
+        if (meta.version !== lastVersion) {
+          lastVersion = meta.version;
+          player.src = `/api/latest_video?v=${meta.version}`;
+          player.load();
+          player.play().catch(() => {});
+        }
+      } catch (_) {}
+    }
+
+    setInterval(pollLatest, 1000);
+    pollLatest();
   </script>
 </body>
 </html>
@@ -165,7 +211,7 @@ _VIEWER_HTML = """\
 # ──────────────────────────────────────────────────────────────────────────
 # Build session + moshi state
 # ──────────────────────────────────────────────────────────────────────────
-def build_imtalker_session(opt, broadcaster: MJPEGBroadcaster) -> LiveMoshiIMTalkerSession:
+def build_imtalker_session(opt, latest_video: LatestVideoStore) -> LiveMoshiIMTalkerSession:
     print("[launch] Loading IMTalker session…")
     session = LiveMoshiIMTalkerSession(
         opt,
@@ -175,25 +221,21 @@ def build_imtalker_session(opt, broadcaster: MJPEGBroadcaster) -> LiveMoshiIMTal
         crop=opt.crop,
         nfe=opt.nfe,
         a_cfg_scale=opt.a_cfg_scale,
+        reply_finalize_delay=opt.reply_finalize_delay,
         moshi_repo=str(_MOSHI_REPO),
         mimi_hf_repo=opt.hf_repo,
     )
 
-    if opt.output_dir:
-        os.makedirs(opt.output_dir, exist_ok=True)
+    output_dir = opt.output_dir or os.path.join(tempfile.gettempdir(), "imtalker_turn_videos")
+    os.makedirs(output_dir, exist_ok=True)
 
-    def _on_chunk(chunk):
-        # Push every frame to MJPEG stream
-        broadcaster.push_chunk(chunk.frames)
-        # Optionally save to disk too
-        if opt.output_dir:
-            out = os.path.join(opt.output_dir, f"chunk_{chunk.chunk_index:04d}.mp4")
-            session.save_chunk_video(chunk, out)
-            print(f"[IMTalker] chunk {chunk.chunk_index:04d} → {out}")
-        else:
-            print(f"[IMTalker] chunk {chunk.chunk_index:04d} rendered ({chunk.frames.shape[0]} frames)")
+    def _on_video(turn_index: int, path: str):
+        latest_path = os.path.join(output_dir, "latest_reply.mp4")
+        os.replace(path, latest_path)
+        latest_video.update(turn_index, latest_path)
+        print(f"[IMTalker] turn {turn_index:04d} rendered → {latest_path}")
 
-    session.frame_callback = _on_chunk
+    session.video_callback = _on_video
     print("[launch] IMTalker session ready.")
     return session
 
@@ -224,6 +266,10 @@ def build_moshi_state(opt, session: LiveMoshiIMTalkerSession):
         device=opt.device,
         output_handler=session.handle_moshi_output,
         user_audio_handler=session.handle_user_audio,
+        max_sentences=opt.max_sentences,
+        max_text_tokens=opt.max_text_tokens,
+        vad_threshold=opt.vad_threshold,
+        vad_silence_frames=opt.vad_silence_frames,
         **checkpoint_info.lm_gen_config,
     )
     print("[launch] Warming up Moshi…")
@@ -241,8 +287,8 @@ def main():
     opt = LaunchOptions().parse()
     opt.rank = opt.device
 
-    broadcaster = MJPEGBroadcaster(jpeg_quality=opt.jpeg_quality)
-    session     = build_imtalker_session(opt, broadcaster)
+    latest_video = LatestVideoStore()
+    session     = build_imtalker_session(opt, latest_video)
     state       = build_moshi_state(opt, session)
 
     # ── Moshi web UI static bundle ─────────────────────────────────────────
@@ -262,8 +308,21 @@ def main():
     app.router.add_static("/assets", path=os.path.join(static_path, "assets"),
                           follow_symlinks=True, name="moshi_static")
 
-    # IMTalker live face stream
-    app.router.add_get("/api/video_feed", broadcaster.stream_response)
+    # IMTalker full response video
+    app.router.add_get(
+        "/api/latest_video_meta",
+        lambda r: web.json_response(
+            {
+                "ready": latest_video.latest_path is not None,
+                "version": latest_video.version,
+                "turn_index": latest_video.turn_index,
+            }
+        ),
+    )
+    app.router.add_get(
+        "/api/latest_video",
+        lambda r: web.FileResponse(latest_video.latest_path) if latest_video.latest_path else web.Response(status=404),
+    )
     app.router.add_get("/viewer", lambda r: web.Response(text=_VIEWER_HTML, content_type="text/html"))
 
     print(f"\n[launch] Moshi chat  → http://localhost:{opt.port}/")

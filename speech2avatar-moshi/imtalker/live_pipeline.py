@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from scipy.io import wavfile
 
 from generator.FM import FMGenerator
 from generator.generate import DataProcessor
@@ -48,6 +50,7 @@ class LiveMoshiIMTalkerSession:
         crop: bool = True,
         nfe: int = 2,
         a_cfg_scale: float = 1.0,
+        reply_finalize_delay: float = 2.0,
         moshi_repo: str | None = None,
         mimi_hf_repo: str = "kyutai/moshiko-pytorch-bf16",
     ):
@@ -73,8 +76,7 @@ class LiveMoshiIMTalkerSession:
         self.prepare_reference(ref_path)
 
         self.mimi = self._load_mimi()
-        self.mimi.streaming_forever(1)
-        self.mimi.reset_streaming()
+        self._mimi_streaming_initialized = False
         self.mimi_frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.chunk_raw_mimi_frames = max(1, int(round(self.chunk_frames * self.mimi.frame_rate / opt.fps)))
 
@@ -83,6 +85,14 @@ class LiveMoshiIMTalkerSession:
         self.fm_stream_state = None
         self.chunk_index = 0
         self.frame_callback: Callable[[RenderedChunk], None] | None = None
+        self.video_callback: Callable[[int, str], None] | None = None
+
+        self.turn_index = 0
+        self.turn_finalize_delay_s = reply_finalize_delay
+        self._pending_reply_latents: list[torch.Tensor] = []
+        self._pending_reply_pcm: list[torch.Tensor] = []
+        self._reply_finalize_task: asyncio.Task | None = None
+        self._reply_generation = 0
 
     def _load_mimi(self):
         _ensure_moshi_importable(self.moshi_repo)
@@ -125,15 +135,47 @@ class LiveMoshiIMTalkerSession:
         self.ref_x = self.renderer.latent_token_encoder(s_tensor)
 
     def _align_raw_mimi_to_imtalker_fps(self, latents: torch.Tensor) -> torch.Tensor:
-        if latents.shape[0] == self.chunk_frames:
+        return self._align_raw_mimi_to_target_frames(latents, self.chunk_frames)
+
+    def _align_raw_mimi_to_target_frames(self, latents: torch.Tensor, target_frames: int) -> torch.Tensor:
+        if latents.shape[0] == target_frames:
             return latents
         aligned = F.interpolate(
             latents.transpose(0, 1).unsqueeze(0),
-            size=self.chunk_frames,
+            size=target_frames,
             mode="linear",
             align_corners=True,
         )[0].transpose(0, 1).contiguous()
         return aligned
+
+    @torch.no_grad()
+    def _render_full_turn(self, latents: torch.Tensor) -> torch.Tensor:
+        if latents.ndim != 2:
+            raise ValueError(f"Expected [T, D] latents, got {tuple(latents.shape)}")
+
+        stream_state = None
+        all_frames = []
+        start = 0
+        total_raw = latents.shape[0]
+
+        while start < total_raw:
+            end = min(start + self.chunk_raw_mimi_frames, total_raw)
+            raw_chunk = latents[start:end]
+            target_frames = max(1, int(round(raw_chunk.shape[0] * self.opt.fps / self.mimi.frame_rate)))
+            aligned_chunk = self._align_raw_mimi_to_target_frames(raw_chunk, target_frames)
+            sample, stream_state = self.fm.sample(
+                {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
+                a_cfg_scale=self.a_cfg_scale,
+                nfe=self.nfe,
+                stream_state=stream_state,
+                return_state=True,
+            )
+            all_frames.append(self._decode_sample_to_frames(sample).detach().cpu())
+            start = end
+
+        if not all_frames:
+            raise RuntimeError("No frames rendered for reply turn")
+        return torch.cat(all_frames, dim=0)
 
     @torch.no_grad()
     def _decode_sample_to_frames(self, sample: torch.Tensor) -> torch.Tensor:
@@ -215,6 +257,10 @@ class LiveMoshiIMTalkerSession:
 
     @torch.no_grad()
     def push_pcm_chunk(self, pcm: torch.Tensor | np.ndarray, sample_rate: int | None = None) -> list[RenderedChunk]:
+        if not self._mimi_streaming_initialized:
+            self.mimi.streaming_forever(1)
+            self.mimi.reset_streaming()
+            self._mimi_streaming_initialized = True
         if isinstance(pcm, torch.Tensor):
             pcm_np = pcm.detach().cpu().float().numpy()
         else:
@@ -240,13 +286,43 @@ class LiveMoshiIMTalkerSession:
 
     async def handle_moshi_output(self, tokens: torch.Tensor, pcm: torch.Tensor, latents: torch.Tensor) -> list[RenderedChunk]:
         del tokens
-        return self.push_mimi_latents(latents[0].transpose(0, 1).contiguous(), aligned=False)
+        self._pending_reply_latents.append(latents[0].transpose(0, 1).contiguous().detach().cpu())
+        self._pending_reply_pcm.append(pcm.detach().cpu())
+        self._reply_generation += 1
+        if self._reply_finalize_task is not None and not self._reply_finalize_task.done():
+            self._reply_finalize_task.cancel()
+        self._reply_finalize_task = asyncio.create_task(self._finalize_reply_after_silence(self._reply_generation))
+        return []
 
     async def handle_user_audio(self, latents: torch.Tensor) -> list[RenderedChunk]:
-        """While the user is speaking, render a neutral/listening face by feeding silence.
-        latents: [B, D, T] from mimi.decode_latent — we use its shape but replace with zeros."""
-        silence = torch.zeros_like(latents[0]).transpose(0, 1).contiguous()  # [T, D] zeros
-        return self.push_mimi_latents(silence, aligned=False)
+        del latents
+        return []
+
+    async def _finalize_reply_after_silence(self, generation: int) -> None:
+        try:
+            await asyncio.sleep(self.turn_finalize_delay_s)
+        except asyncio.CancelledError:
+            return
+
+        if generation != self._reply_generation or not self._pending_reply_latents:
+            return
+
+        reply_latents = torch.cat(self._pending_reply_latents, dim=0)
+        reply_pcm = torch.cat([chunk.reshape(-1) for chunk in self._pending_reply_pcm], dim=0)
+        self._pending_reply_latents = []
+        self._pending_reply_pcm = []
+
+        turn_index = self.turn_index
+        self.turn_index += 1
+        output_dir = tempfile.mkdtemp(prefix="imtalker_reply_")
+
+        def _render_and_save() -> str:
+            frames = self._render_full_turn(reply_latents)
+            return self.save_response_video(frames, reply_pcm, os.path.join(output_dir, f"reply_{turn_index:04d}.mp4"))
+
+        output_path = await asyncio.to_thread(_render_and_save)
+        if self.video_callback is not None:
+            self.video_callback(turn_index, output_path)
 
     def save_chunk_video(self, rendered_chunk: RenderedChunk, output_path: str, audio_path: str | None = None) -> str:
         frames = rendered_chunk.frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)
@@ -260,4 +336,28 @@ class LiveMoshiIMTalkerSession:
                 os.remove(tmp_path)
         else:
             os.replace(tmp_path, output_path)
+        return output_path
+
+    def save_response_video(self, frames: torch.Tensor, pcm: torch.Tensor, output_path: str) -> str:
+        frames_hwc = frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)
+        frames_hwc = (frames_hwc * 255).byte()
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
+            tmp_video_path = tmp_video.name
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+            tmp_wav_path = tmp_wav.name
+
+        torchvision.io.write_video(tmp_video_path, frames_hwc, fps=self.opt.fps)
+        wavfile.write(tmp_wav_path, int(self.mimi.sample_rate), pcm.detach().cpu().float().numpy())
+
+        os.system(
+            f'ffmpeg -loglevel quiet -y -i "{tmp_video_path}" -i "{tmp_wav_path}" '
+            f'-c:v copy -c:a aac -shortest "{output_path}"'
+        )
+
+        if os.path.exists(tmp_video_path):
+            os.remove(tmp_video_path)
+        if os.path.exists(tmp_wav_path):
+            os.remove(tmp_wav_path)
         return output_path
