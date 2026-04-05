@@ -60,6 +60,7 @@ class AVSegmentStore:
         self.current_turn = -1
         self.done = True
         self.segments: dict[int, dict[int, str]] = {}
+        self._full_video: dict[int, str] = {}
 
     def set_idle(self, path: str):
         with self._lock:
@@ -82,16 +83,56 @@ class AVSegmentStore:
         with self._lock:
             if self.current_turn == turn_id:
                 self.done = True
+        # Stitch segments into one video in the background
+        threading.Thread(target=self._stitch_turn, args=(turn_id,), daemon=True).start()
+
+    def _stitch_turn(self, turn_id: int):
+        """Concatenate all segment MP4s into one seamless video."""
+        import subprocess, tempfile, time as _time
+        t_stitch_start = _time.perf_counter()
+        with self._lock:
+            seg_map = self.segments.get(turn_id, {})
+            if not seg_map:
+                return
+            paths = [seg_map[i] for i in sorted(seg_map.keys())]
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+                concat_list = f.name
+                for p in paths:
+                    f.write(f"file '{p}'\n")
+            out_dir = os.path.dirname(paths[0])
+            out_path = os.path.join(out_dir, f"full_turn_{turn_id:04d}.mp4")
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c", "copy", out_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            os.remove(concat_list)
+            if result.returncode == 0 and os.path.exists(out_path):
+                with self._lock:
+                    self._full_video[turn_id] = out_path
+                print(f"[TIMING] stitch turn {turn_id} | {len(paths)} segments | {_time.perf_counter()-t_stitch_start:.3f}s → {out_path}")
+            else:
+                print(f"[AVStore] Stitch failed: {result.stderr.strip()}")
+        except Exception as e:
+            print(f"[AVStore] Stitch error: {e}")
+
+    def get_full_video_path(self, turn_id: int) -> str | None:
+        with self._lock:
+            return self._full_video.get(turn_id)
 
     def state(self) -> dict:
         with self._lock:
             segment_indices = sorted(self.segments.get(self.current_turn, {}).keys())
+            full_video = self._full_video.get(self.current_turn)
             return {
                 "idle_ready": self.idle_path is not None,
                 "idle_version": self.idle_version,
                 "turn_id": self.current_turn,
                 "done": self.done,
                 "segments": segment_indices,
+                "full_video": full_video is not None,
             }
 
     def get_idle_path(self) -> str | None:
@@ -245,6 +286,10 @@ _VIEWER_HTML = """\
     let controllerReloadScheduled = false;
     let lastControllerResetTurn = -1;
     let currentPlaybackUrl = null;
+    let playbackStarted = false;         // true once first segment begins playing this turn
+    const BUFFER_BEFORE_PLAY = 2;        // wait for N segments before starting playback
+    let totalSegmentsPlayed = 0;         // segments played this turn
+    let switchedToFull = false;          // true once we switched to the stitched full video
 
     function setStatus(text, mode) {
       statusEl.textContent = text;
@@ -297,8 +342,11 @@ _VIEWER_HTML = """\
       } finally {
         loading.delete(key);
       }
-      // Kick playback after fetch completes (and loading count decremented)
-      if (!playing) playNext();
+      // Buffer before first play: wait for BUFFER_BEFORE_PLAY segments (or turn done)
+      if (!playing) {
+        const ready = pending.length + loading.size >= BUFFER_BEFORE_PLAY || (turnDone && !loading.size);
+        if (ready || playbackStarted) playNext();
+      }
     }
 
     async function playNext() {
@@ -311,14 +359,25 @@ _VIEWER_HTML = """\
         }
         playing = false;
         if (turnDone) {
-          console.log('[avatar] playNext: all segments played, turn done — returning to idle');
+          console.log('[avatar] playNext: all', totalSegmentsPlayed, 'segments played, returning to idle');
           await ensureIdle({ idle_ready: true, idle_version: idleVersion }, { force: true });
           maybeReloadController();
         }
         return;
       }
+      // Buffer gate: before first play, wait for enough segments unless turn already done
+      if (!playbackStarted) {
+        const enough = pending.length >= BUFFER_BEFORE_PLAY || (turnDone && !loading.size);
+        if (!enough) {
+          console.log('[avatar] playNext: buffering…', pending.length, '/', BUFFER_BEFORE_PLAY);
+          setStatus(`Buffering reply (${pending.length}/${BUFFER_BEFORE_PLAY})…`, 'Buffering');
+          return;
+        }
+        playbackStarted = true;
+      }
       const next = pending.shift();
       playing = true;
+      totalSegmentsPlayed++;
       avatar.pause();
       revokePlaybackUrlIfNeeded();
       avatar.src = next.url;
@@ -326,8 +385,30 @@ _VIEWER_HTML = """\
       avatar.muted = false;
       avatar.loop = false;
       avatar.dataset.mode = 'speaking';
-      console.log('[avatar] playNext: playing segment', next.segmentIndex, '| pending:', pending.length, '| loading:', loading.size);
-      setStatus(`Playing reply chunk ${next.segmentIndex + 1}`, 'Speaking');
+      console.log('[avatar] playing segment', next.segmentIndex, '| queued:', pending.length, '| loading:', loading.size);
+      setStatus(`Playing reply (${totalSegmentsPlayed})`, 'Speaking');
+      try { await avatar.play(); } catch (_) {}
+    }
+
+    async function switchToFullVideo(turnId) {
+      switchedToFull = true;
+      // Discard remaining chunk queue — full video replaces everything
+      clearPendingSegments();
+      loading.clear();
+      playing = true;
+      avatar.pause();
+      revokePlaybackUrlIfNeeded();
+      const res = await fetch(`/api/full_video/${turnId}?t=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) { playing = false; return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      avatar.src = url;
+      currentPlaybackUrl = url;
+      avatar.muted = false;
+      avatar.loop = false;
+      avatar.dataset.mode = 'speaking';
+      console.log('[avatar] switched to full stitched video for turn', turnId);
+      setStatus('Playing full reply', 'Speaking');
       try { await avatar.play(); } catch (_) {}
     }
 
@@ -362,6 +443,9 @@ _VIEWER_HTML = """\
         if (meta.turn_id !== currentTurn) {
           clearPendingSegments();
           playing = false;
+          playbackStarted = false;
+          totalSegmentsPlayed = 0;
+          switchedToFull = false;
           currentTurn = meta.turn_id;
           lastSeenSegment = -1;
           turnDone = meta.done;
@@ -376,8 +460,15 @@ _VIEWER_HTML = """\
             }
           }
         }
+        // If the full stitched video is ready and we haven't started chunk playback yet,
+        // jump straight to the full video for seamless single-file playback.
+        // Don't interrupt mid-chunk playback — chunks will finish naturally.
+        if (meta.full_video && currentTurn >= 0 && !switchedToFull && !playbackStarted) {
+          switchToFullVideo(meta.turn_id);
+        }
         if (!playing && pending.length) {
-          playNext();
+          const ready = playbackStarted || pending.length >= BUFFER_BEFORE_PLAY || (turnDone && !loading.size);
+          if (ready) playNext();
         }
         if (!playing && turnDone && currentTurn >= 0 && !pending.length && !loading.size) {
           maybeReloadController();
@@ -420,6 +511,9 @@ _VIEWER_HTML = """\
       lastSeenSegment = -1;
       lastControllerResetTurn = -1;
       playing = false;
+      playbackStarted = false;
+      totalSegmentsPlayed = 0;
+      switchedToFull = false;
       controllerStarted = false;
       controller.src = 'about:blank';
       await ensureIdle({ idle_ready: true, idle_version }, { force: true });
@@ -542,6 +636,12 @@ def main():
         lambda r: web.FileResponse(
             segments.get_segment_path(int(r.match_info["turn"]), int(r.match_info["segment"]))
         ) if segments.get_segment_path(int(r.match_info["turn"]), int(r.match_info["segment"])) else web.Response(status=404),
+    )
+
+    app.router.add_get(
+        r"/api/full_video/{turn:\d+}",
+        lambda r: web.FileResponse(segments.get_full_video_path(int(r.match_info["turn"])))
+            if segments.get_full_video_path(int(r.match_info["turn"])) else web.Response(status=404),
     )
 
     app.router.add_get("/", lambda r: web.Response(text=_VIEWER_HTML, content_type="text/html"))

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import time
 import librosa
 import numpy as np
 import torch
@@ -196,12 +197,18 @@ class LiveMoshiIMTalkerSession:
 
     @torch.no_grad()
     def _render_reply_chunk(self, pcm_chunk: torch.Tensor) -> RenderedChunk:
+        t_chunk_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         latents = self._encode_reply_pcm_to_latents(pcm_chunk)
+        t_mimi = time.perf_counter() - t0
         if latents.shape[0] == 0:
             raise RuntimeError("Cannot render empty reply chunk")
 
         target_frames = max(1, int(round(latents.shape[0] * self.opt.fps / self.mimi.frame_rate)))
         aligned_chunk = self._align_raw_mimi_to_target_frames(latents, target_frames)
+
+        t0 = time.perf_counter()
         stream_state = self.fm_stream_state
         sample, next_state = self.fm.sample(
             {"ref_x": self.ref_x, "a_feat": aligned_chunk.to(self.device)},
@@ -210,8 +217,15 @@ class LiveMoshiIMTalkerSession:
             stream_state=stream_state,
             return_state=True,
         )
+        torch.cuda.synchronize()
+        t_generator = time.perf_counter() - t0
         self.fm_stream_state = next_state
+
+        t0 = time.perf_counter()
         frames = self._decode_sample_to_frames(sample)
+        torch.cuda.synchronize()
+        t_renderer = time.perf_counter() - t0
+
         result = RenderedChunk(
             chunk_index=self.chunk_index,
             frames=frames.detach().cpu(),
@@ -219,6 +233,12 @@ class LiveMoshiIMTalkerSession:
             conditioning_latents=aligned_chunk.detach().cpu(),
         )
         self.chunk_index += 1
+
+        t_total = time.perf_counter() - t_chunk_start
+        print(f"[TIMING] chunk {result.chunk_index:03d} | "
+              f"mimi_encode={t_mimi:.3f}s  generator={t_generator:.3f}s  renderer={t_renderer:.3f}s  "
+              f"total={t_total:.3f}s  ({target_frames} frames)")
+
         if self.frame_callback is not None:
             self.frame_callback(result)
         return result
@@ -255,10 +275,16 @@ class LiveMoshiIMTalkerSession:
                 turn_id, segment_index, pcm_chunk = self._render_queue.pop(0)
 
                 def _render_and_save() -> str:
+                    t_seg_start = time.perf_counter()
                     rendered = self._render_reply_chunk(pcm_chunk)
                     output_dir = tempfile.mkdtemp(prefix=f"imtalker_segment_{turn_id:04d}_")
                     output_path = os.path.join(output_dir, f"segment_{segment_index:04d}.mp4")
-                    return self.save_response_video(rendered.frames, pcm_chunk, output_path)
+                    path = self.save_response_video(rendered.frames, pcm_chunk, output_path)
+                    t_seg_total = time.perf_counter() - t_seg_start
+                    pcm_sec = pcm_chunk.numel() / self.mimi.sample_rate
+                    print(f"[TIMING] segment {turn_id:04d}/{segment_index:04d} TOTAL={t_seg_total:.3f}s  "
+                          f"(audio={pcm_sec:.2f}s, ratio={t_seg_total/max(pcm_sec,0.01):.1f}x realtime)")
+                    return path
 
                 try:
                     output_path = await asyncio.to_thread(_render_and_save)
@@ -315,10 +341,16 @@ class LiveMoshiIMTalkerSession:
         """Buffer Moshi reply PCM and progressively publish AV segments."""
         del tokens, latents
         turn_id = self._ensure_turn_started()
-        del turn_id
         flat_pcm = pcm.detach().cpu().float().reshape(-1)
         self._reply_pcm_buffer = torch.cat([self._reply_pcm_buffer, flat_pcm], dim=0)
+        buffered_sec = self._reply_pcm_buffer.numel() / self.mimi.sample_rate
+        queue_before = len(self._render_queue)
         self._enqueue_ready_segments()
+        queue_after = len(self._render_queue)
+        if queue_after > queue_before:
+            print(f"[TIMING] moshi_output turn={turn_id} | +{flat_pcm.numel()} samples | "
+                  f"buffer={buffered_sec:.2f}s | enqueued {queue_after-queue_before} segment(s) | "
+                  f"render_queue={queue_after}")
         if self._render_queue:
             self._ensure_render_worker()
         return []
@@ -371,40 +403,44 @@ class LiveMoshiIMTalkerSession:
         return output_path
 
     def save_response_video(self, frames: torch.Tensor, pcm: torch.Tensor, output_path: str) -> str:
+        t_save_start = time.perf_counter()
+
         frames_hwc = frames.permute(0, 2, 3, 1).detach().clamp(-1, 1)
-        frames_hwc = (frames_hwc * 255).byte()
+        frames_hwc = (frames_hwc * 255).byte().numpy()
+        n, h, w, c = frames_hwc.shape
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
-            tmp_video_path = tmp_video.name
+        t0 = time.perf_counter()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
             tmp_wav_path = tmp_wav.name
-
-        torchvision.io.write_video(tmp_video_path, frames_hwc, fps=self.opt.fps)
         wavfile.write(tmp_wav_path, int(self.mimi.sample_rate), pcm.detach().cpu().float().numpy())
+        t_write_wav = time.perf_counter() - t0
 
-        mux_cmd = [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            tmp_video_path,
-            "-i",
-            tmp_wav_path,
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
+        # Pipe raw RGB frames directly to ffmpeg — avoids torchvision.io.write_video overhead
+        t0 = time.perf_counter()
+        cmd = [
+            "ffmpeg", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", str(self.opt.fps),
+            "-i", "pipe:0",
+            "-i", tmp_wav_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
             "-shortest",
             output_path,
         ]
-        result = subprocess.run(mux_cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Use communicate() to avoid pipe deadlock — it handles large writes safely
+        raw_bytes = frames_hwc.tobytes()
+        _, stderr = proc.communicate(input=raw_bytes)
+        t_ffmpeg = time.perf_counter() - t0
 
-        if os.path.exists(tmp_video_path):
-            os.remove(tmp_video_path)
         if os.path.exists(tmp_wav_path):
             os.remove(tmp_wav_path)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg mux failed: {result.stderr.strip()}")
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg pipe mux failed: {stderr.decode().strip()}")
+
+        t_total = time.perf_counter() - t_save_start
+        print(f"[TIMING] save_video | write_wav={t_write_wav:.3f}s  ffmpeg_pipe={t_ffmpeg:.3f}s  total={t_total:.3f}s")
         return output_path
