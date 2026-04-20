@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,9 @@ class FMGenerator(nn.Module):
         self.fps = opt.fps
         self.rank = opt.rank
 
+        # Load motion normalization stats (computed offline from training data)
+        self._load_motion_stats(opt)
+
         self.num_frames_for_clip = int(opt.wav2vec_sec * opt.fps)
         self.num_prev_frames = int(opt.num_prev_frames)
         self.num_total_frames = self.num_frames_for_clip + self.num_prev_frames
@@ -29,8 +33,36 @@ class FMGenerator(nn.Module):
         self.pose_projection = self._make_projection(3, opt.dim_c)
         self.cam_projection = self._make_projection(3, opt.dim_c)
 
-        self._freeze_frontend()
+        if getattr(opt, "freeze_frontend", False):
+            self._freeze_frontend()
         self._print_model_stats()
+
+    def _load_motion_stats(self, opt):
+        """Load per-dimension motion normalization stats for unnormalizing at inference."""
+        stats_path = None
+        if hasattr(opt, "dataset_path") and opt.dataset_path:
+            stats_path = Path(opt.dataset_path) / "motion_stats.pt"
+        if stats_path and stats_path.exists():
+            stats = torch.load(stats_path, map_location="cpu")
+            self.register_buffer("motion_mean", stats["mean"])
+            self.register_buffer("motion_std", stats["std"])
+            print(f"[Info] Loaded motion stats for unnormalization: mean_range=[{stats['mean'].min():.2f}, {stats['mean'].max():.2f}]")
+        else:
+            self.motion_mean = None
+            self.motion_std = None
+            print("[Warning] No motion_stats.pt found — sampling will output raw (unnormalized) latents")
+
+    def _unnormalize_motion(self, m):
+        """Convert normalized motion latents back to renderer space."""
+        if self.motion_mean is not None:
+            return m * self.motion_std.to(m.device) + self.motion_mean.to(m.device)
+        return m
+
+    def _normalize_motion(self, m):
+        """Normalize motion latents to zero-mean, unit-variance (for ref_x at inference)."""
+        if self.motion_mean is not None:
+            return (m - self.motion_mean.to(m.device)) / self.motion_std.to(m.device)
+        return m
 
     def _make_projection(self, in_dim, out_dim):
         return nn.Sequential(
@@ -284,7 +316,8 @@ class FMGenerator(nn.Module):
             prev_cam_ctx = cam_t[:, -self.num_prev_frames:]
 
         sample = torch.cat(samples, dim=1)[:, :total_frames]
-        return sample
+        # Unnormalize from training space back to renderer space
+        return self._unnormalize_motion(sample)
 
 
 class AudioEncoder(nn.Module):

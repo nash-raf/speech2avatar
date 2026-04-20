@@ -1,0 +1,32 @@
+[launch] Loading IMTalker session...
+Some weights of the model checkpoint at ./checkpoints/wav2vec2-base-960h were not used when initializing Wav2VecModel: ['wav2vec2.encoder.pos_conv_embed.conv.weight_v', 'lm_head.weight', 'lm_head.bias', 'wav2vec2.encoder.pos_conv_embed.conv.weight_g']
+- This IS expected if you are initializing Wav2VecModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing Wav2VecModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+Some weights of Wav2VecModel were not initialized from the model checkpoint at ./checkpoints/wav2vec2-base-960h and are newly initialized: ['wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1', 'wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original0', 'wav2vec2.masked_spec_embed']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+
+[Model Stats] Parameters: 134,506,784 | Trainable: 40,135,072
+[IMTalker] generator load: checkpoint=/workspace/exps/phase2_bridge_finetune/checkpoints/step=050000.ckpt loaded=326 adapter_mode=bridge_to_768 adapter_params_loaded=6 audio_projection_params_loaded=4 use_ema=True ema_params_merged=6
+[ WARN:0@5.818] global loadsave.cpp:248 findDecoder imread_('/workspace/sources/source_5.png'): can't open/read file: check file path/integrity
+Traceback (most recent call last):
+  File "/workspace/IMTalker/launch_live_ws.py", line 1207, in <module>
+    main()
+  File "/workspace/IMTalker/launch_live_ws.py", line 1143, in main
+    session = build_imtalker_session(opt)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/IMTalker/launch_live.py", line 1333, in build_imtalker_session
+    session = LiveMoshiIMTalkerSession(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/IMTalker/live_pipeline.py", line 193, in __init__
+    self.prepare_reference(ref_path)
+  File "/workspace/preprocess_5090/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/IMTalker/live_pipeline.py", line 412, in prepare_reference
+    image = self.data_processor.default_img_loader(ref_path)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/IMTalker/live_pipeline.py", line 137, in default_img_loader
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+cv2.error: OpenCV(4.9.0) /io/opencv/modules/imgproc/src/color.cpp:196: error: (-215:Assertion failed) !_src.empty() in function 'cvtColor'
+

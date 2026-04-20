@@ -22,7 +22,7 @@ class AudioMotionSmirkGazeDataset(Dataset):
         # Define subdirectories
         root_path = Path(opt.dataset_path)
         motion_dir = root_path / "motion"
-        audio_dir = root_path / getattr(opt, 'audio_subdir', 'audio')
+        audio_dir = root_path / getattr(opt, "audio_subdir", "audio")
         smirk_dir = root_path / "smirk"
         gaze_dir = root_path / "gaze"
 

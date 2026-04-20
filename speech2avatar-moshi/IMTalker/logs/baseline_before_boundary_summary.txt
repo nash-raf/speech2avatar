@@ -1,0 +1,18 @@
+log: /workspace/IMTalker/live_ws_debug.log
+chunks: 15
+boundary_l2:
+  mean   : 0.136
+  median : 0.139
+  p90    : 0.196
+  p95    : 0.230
+  p99    : 0.268
+  max    : 0.278
+  spikes (>1.0, top 10 by value): 0 total
+mimi (from DBG/mimi, 17 entries):
+  full_samples mean=23944 min=23040 max=24960
+  remainder    mean=508 min=0 max=960
+  empty-chunk events (full_samples=0): 0
+x0 head_norm (17 entries):
+  mean=4.875 min=4.787 max=5.531
+chunk_age (45 entries):
+  mean=0.655 p95=0.878 max=0.887

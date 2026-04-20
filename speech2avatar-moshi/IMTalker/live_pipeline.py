@@ -1,0 +1,1091 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import queue as _queue_mod
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import cv2
+import face_alignment
+from PIL import Image
+import torch
+import torch.nn.functional as F
+import torchaudio
+import torchvision.transforms as transforms
+
+from generator.FM import FMGenerator
+from renderer.models import IMTRenderer
+
+
+def _default_moshi_repo() -> Path:
+    return Path(__file__).resolve().parent.parent / "moshi"
+
+
+def _maybe_torch_compile_renderer(ae: IMTRenderer) -> None:
+    """Opt-in renderer compilation via IMTALKER_TORCH_COMPILE env var.
+
+    Values:
+        frame_decoder | 1 | true   - compile SynthesisNetwork only (CUDA graphs)
+        decode_default             - compile full decode() with mode="default"
+        0 | false | off | ""      - disabled
+    """
+    raw = os.environ.get("IMTALKER_TORCH_COMPILE", "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off"):
+        return
+    if not hasattr(torch, "compile"):
+        print("[IMTalker] torch.compile not available; skipping renderer compile.")
+        return
+
+    target = "frame_decoder" if raw in ("1", "true", "yes", "on") else raw
+    if target not in ("frame_decoder", "decode_default"):
+        print(
+            "[IMTalker] IMTALKER_TORCH_COMPILE must be frame_decoder, "
+            "decode_default, or 1; got %r; skip." % (raw,)
+        )
+        return
+    try:
+        if target == "decode_default":
+            ae.decode = torch.compile(ae.decode, mode="default", fullgraph=False)
+            print("[IMTalker] torch.compile: IMTRenderer.decode, mode=default (no CUDA graphs).")
+        else:
+            ae.frame_decoder = torch.compile(
+                ae.frame_decoder, mode="reduce-overhead", fullgraph=False
+            )
+            print("[IMTalker] torch.compile: SynthesisNetwork (frame_decoder), mode=reduce-overhead.")
+    except Exception as exc:
+        print(f"[IMTalker] torch.compile failed ({exc}); using eager renderer.")
+
+
+def _ensure_moshi_importable(moshi_repo: str | None = None) -> None:
+    repo = Path(moshi_repo) if moshi_repo else _default_moshi_repo()
+    pkg_root = repo / "moshi"
+    if pkg_root.exists() and str(pkg_root) not in sys.path:
+        sys.path.insert(0, str(pkg_root))
+
+
+@dataclass
+class RenderedChunk:
+    chunk_index: int
+    frames: torch.Tensor
+    sample_latents: torch.Tensor
+    conditioning_latents: torch.Tensor
+    enqueue_wall_ts: float = 0.0
+    render_start_wall_ts: float = 0.0
+    render_done_wall_ts: float = 0.0
+
+
+@dataclass
+class PendingRenderChunk:
+    chunk_index: int
+    reply_generation: int
+    pcm: torch.Tensor
+    valid_samples: int
+    enqueue_wall_ts: float
+
+
+class ReferenceDataProcessor:
+    def __init__(self):
+        self.fa = face_alignment.FaceAlignment(
+            face_alignment.LandmarksType.TWO_D, flip_input=False
+        )
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((512, 512)),
+                transforms.ToTensor(),
+            ]
+        )
+
+    @torch.no_grad()
+    def process_img(self, img: Image.Image) -> Image.Image:
+        img_arr = np.array(img)
+        h, w = img_arr.shape[:2]
+        bboxes = self.fa.face_detector.detect_from_image(img_arr)
+        valid_bboxes = [
+            (int(x1), int(y1), int(x2), int(y2), score)
+            for (x1, y1, x2, y2, score) in bboxes
+            if score > 0.95
+        ]
+        if not valid_bboxes:
+            raise ValueError("No face detected in the reference image.")
+
+        x1, y1, x2, y2, _ = valid_bboxes[0]
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        half_w = int((x2 - x1) * 0.8)
+        half_h = int((y2 - y1) * 0.8)
+        half = max(half_w, half_h)
+
+        x1_new = max(cx - half, 0)
+        x2_new = min(cx + half, w)
+        y1_new = max(cy - half, 0)
+        y2_new = min(cy + half, h)
+
+        side = min(x2_new - x1_new, y2_new - y1_new)
+        x2_new = x1_new + side
+        y2_new = y1_new + side
+
+        crop_img = img_arr[y1_new:y2_new, x1_new:x2_new]
+        return Image.fromarray(crop_img)
+
+    def default_img_loader(self, path: str) -> Image.Image:
+        img = cv2.imread(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(img)
+
+
+class LiveMoshiIMTalkerSession:
+    """Progressively render Moshi reply PCM with IMTalker.
+
+    This intentionally keeps the current compatibility path:
+    reply PCM -> Mimi encode_to_latent(quantize=False) -> FM.sample(a_feat=...) -> renderer.
+    """
+
+    def __init__(
+        self,
+        opt,
+        generator_path: str,
+        renderer_path: str,
+        ref_path: str,
+        *,
+        crop: bool = True,
+        nfe: int = 2,
+        a_cfg_scale: float = 1.0,
+        moshi_repo: str | None = None,
+        mimi_hf_repo: str = "kyutai/moshiko-pytorch-bf16",
+    ):
+        self.opt = opt
+        self.device = torch.device(getattr(opt, "rank", "cuda"))
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        self.nfe = nfe
+        self.a_cfg_scale = a_cfg_scale
+        self.crop = crop
+        self.debug_session = bool(getattr(opt, "debug_session", False))
+        self.use_stream_state = bool(getattr(opt, "use_stream_state", False))
+        self.chunk_frames = int(round(opt.wav2vec_sec * opt.fps))
+        self.chunk_sec = float(getattr(opt, "chunk_sec", 1.5))
+        self.render_workers = max(1, int(getattr(opt, "render_workers", 2)))
+        self.moshi_repo = moshi_repo
+        self.mimi_hf_repo = mimi_hf_repo
+        dump_reply_dir = getattr(opt, "dump_reply_dir", None)
+        self.dump_reply_dir = Path(dump_reply_dir) if dump_reply_dir else None
+        if self.dump_reply_dir is not None:
+            self.dump_reply_dir.mkdir(parents=True, exist_ok=True)
+
+        self.fm = FMGenerator(opt).to(self.device).eval()
+        self.renderer = IMTRenderer(opt).to(self.device).eval()
+        self.data_processor = ReferenceDataProcessor()
+
+        self._load_generator_weights(generator_path)
+        self._load_renderer_weights(renderer_path)
+        _maybe_torch_compile_renderer(self.renderer)
+        self._render_batch_size = max(1, int(getattr(opt, "render_batch_size", 4)))
+
+        self.ref_x = None
+        self.f_r = None
+        self.g_r = None
+        self.idle_frame = None
+        self.prepare_reference(ref_path)
+
+        self.mimi = self._load_mimi()
+        self.mimi_frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        self.render_window_frames = self.chunk_frames
+        self.chunk_samples = max(
+            self.mimi_frame_size, int(round(self.chunk_sec * self.mimi.sample_rate))
+        )
+        self.emit_step_frames = max(
+            1, int(round(self.chunk_samples * self.opt.fps / self.mimi.sample_rate))
+        )
+        self.overlap_frames = max(0, self.render_window_frames - self.emit_step_frames)
+        self.overlap_latent_count = int(
+            round(self.overlap_frames * self.mimi.frame_rate / self.opt.fps)
+        )
+        self.boundary_blend_frames = max(0, int(getattr(opt, "boundary_blend_frames", 4)))
+        self.overlap_context_scale = max(
+            1.0, float(getattr(opt, "overlap_context_scale", 2.0))
+        )
+        context_floor = int(
+            round(
+                max(self.overlap_frames, self.boundary_blend_frames)
+                * self.mimi.frame_rate
+                / self.opt.fps
+            )
+        )
+        self.overlap_context_latent_count = max(
+            context_floor,
+            int(round(self.overlap_latent_count * self.overlap_context_scale)),
+        )
+        if self.debug_session:
+            print(
+                "[DBG/config] "
+                f"ws_audio_buffer_ms={float(getattr(opt, 'ws_audio_buffer_ms', -1.0))} "
+                f"chunk_sec={self.chunk_sec} "
+                f"chunk_samples={self.chunk_samples} "
+                f"mimi_sr={self.mimi.sample_rate} "
+                f"mimi_fr={self.mimi.frame_rate} "
+                f"render_window_frames={self.render_window_frames} "
+                f"emit_step_frames={self.emit_step_frames} "
+                f"overlap_frames={self.overlap_frames} "
+                f"overlap_latent_count={self.overlap_latent_count} "
+                f"overlap_context_latent_count={self.overlap_context_latent_count} "
+                f"boundary_blend_frames={self.boundary_blend_frames} "
+                f"use_stream_state={self.use_stream_state} "
+                f"nfe={self.nfe} "
+                f"a_cfg_scale={self.a_cfg_scale} "
+                f"wav2vec_sec={self.opt.wav2vec_sec} "
+                f"fps={self.opt.fps} "
+                f"num_prev_frames={self.opt.num_prev_frames}"
+            )
+        self._av_audio_sample_rate = 48000
+        self._av_samples_per_frame = int(round(self._av_audio_sample_rate / self.opt.fps))
+        self._av_resampler = None
+        src_sr = int(self.mimi.sample_rate)
+        if src_sr != self._av_audio_sample_rate:
+            self._av_resampler = torchaudio.transforms.Resample(
+                orig_freq=src_sr,
+                new_freq=self._av_audio_sample_rate,
+                lowpass_filter_width=6,
+                resampling_method="sinc_interp_kaiser",
+            ).to(self.device)
+            self._av_resampler.eval()
+
+        # av_session is set externally by the fMP4 HTTP handler when a viewer
+        # connects. Render output is pushed there as (frames_uint8_hwc, pcm48_int16);
+        # while None, render work is skipped (no point burning GPU with no viewer).
+        self.av_session = None  # type: ignore[assignment]
+
+        self.fm_stream_state = None
+        self.static_pose = self._parse_static_vector(getattr(opt, "static_pose", None), 3, "static_pose")
+        self.static_cam = self._parse_static_vector(getattr(opt, "static_cam", None), 3, "static_cam")
+        self.static_gaze = self._parse_static_vector(getattr(opt, "static_gaze", None), 2, "static_gaze")
+        self._frame_residual = 0.0
+        self._mimi_reply_stream_ready = False
+        self._mimi_pcm_residual = torch.zeros((0,), dtype=torch.float32)
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        self._reply_wall_t0 = 0.0
+        self._reply_pcm_generated = 0
+        self._reply_chunks_enqueued = 0
+        self._reply_chunks_rendered = 0
+        self._reply_chunks_pushed = 0
+        self._dump_reply_pcm_chunks: list[torch.Tensor] = []
+        self._dump_reply_latent_chunks: list[torch.Tensor] = []
+        self._reply_generation = 0
+        self._max_render_queue = 0
+        self._prev_chunk_last_latent = None
+        self._prev_chunk_tail_latents = None
+        self._overlap_latents = None
+        self._render_queue: _queue_mod.Queue[PendingRenderChunk] = _queue_mod.Queue()
+        self._render_threads: list[threading.Thread] = []
+        self._render_stop = threading.Event()
+        self._next_chunk_index = 0
+        self._next_fm_chunk_index = 0
+        self._next_emit_chunk_index = 0
+        self._ready_chunks: dict[int, tuple[RenderedChunk, torch.Tensor]] = {}
+        self._fm_cv = threading.Condition()
+        self._emit_lock = threading.Lock()
+
+    def _load_mimi(self):
+        _ensure_moshi_importable(self.moshi_repo)
+        from moshi.models import loaders
+
+        checkpoint = loaders.CheckpointInfo.from_hf_repo(self.mimi_hf_repo)
+        mimi = checkpoint.get_mimi(device=str(self.device))
+        mimi.eval()
+        return mimi
+
+    def _parse_static_vector(self, raw, expected_dim: int, name: str):
+        if raw is None:
+            return None
+        if torch.is_tensor(raw):
+            tensor = raw.detach().float().view(-1)
+        else:
+            text = str(raw).strip()
+            if not text:
+                return None
+            parts = [p.strip() for p in text.split(",")]
+            if len(parts) != expected_dim:
+                raise ValueError(f"{name} must have exactly {expected_dim} comma-separated values; got {raw!r}")
+            tensor = torch.tensor([float(p) for p in parts], dtype=torch.float32)
+        if tensor.numel() != expected_dim:
+            raise ValueError(f"{name} must have exactly {expected_dim} values; got {tensor.numel()}")
+        return tensor.view(1, 1, expected_dim)
+
+    def _static_condition_seq(self, base: torch.Tensor | None, target_frames: int):
+        if base is None:
+            return None
+        return base.to(self.device).expand(1, target_frames, -1).contiguous()
+
+    def _select_best_state_dict(self, checkpoint: dict, model_state_dict: dict) -> dict:
+        raw_state = checkpoint.get("state_dict", checkpoint)
+        if isinstance(raw_state, dict) and "model" in raw_state and isinstance(raw_state["model"], dict):
+            raw_state = raw_state["model"]
+
+        if not isinstance(raw_state, dict):
+            raise RuntimeError(f"Unsupported checkpoint structure for generator load: {type(raw_state)!r}")
+
+        candidates = [raw_state]
+        for prefix in ("model.", "student.", "teacher."):
+            stripped = {k[len(prefix):]: v for k, v in raw_state.items() if k.startswith(prefix)}
+            if stripped:
+                candidates.append(stripped)
+
+        best_state = None
+        best_match_count = -1
+        for candidate in candidates:
+            match_count = sum(
+                1
+                for k, v in candidate.items()
+                if k in model_state_dict and model_state_dict[k].shape == v.shape
+            )
+            if match_count > best_match_count:
+                best_match_count = match_count
+                best_state = candidate
+
+        if best_state is None or best_match_count <= 0:
+            raise RuntimeError("Could not find a compatible full generator state_dict in checkpoint.")
+        return best_state
+
+    def _merge_ema_shadow(self, checkpoint: dict, full_state: dict, model_state_dict: dict) -> tuple[dict, int]:
+        if not getattr(self.opt, "use_ema", True):
+            return full_state, 0
+        ema_state = checkpoint.get("ema_state_dict")
+        if not isinstance(ema_state, dict):
+            return full_state, 0
+
+        merged = dict(full_state)
+        applied = 0
+        for k, v in ema_state.items():
+            if k in model_state_dict and model_state_dict[k].shape == v.shape:
+                merged[k] = v
+                applied += 1
+        return merged, applied
+
+    def _load_generator_weights(self, checkpoint_path: str) -> None:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        model_state_dict = self.fm.state_dict()
+        state_dict = self._select_best_state_dict(checkpoint, model_state_dict)
+        state_dict, ema_applied = self._merge_ema_shadow(checkpoint, state_dict, model_state_dict)
+        loadable = {k: v for k, v in state_dict.items() if k in model_state_dict and model_state_dict[k].shape == v.shape}
+        missing, unexpected = self.fm.load_state_dict(loadable, strict=False)
+        adapter_loaded = sorted(k for k in loadable if k.startswith("audio_adapter."))
+        projection_loaded = sorted(k for k in loadable if k.startswith("audio_projection."))
+        mode = str(getattr(self.opt, "audio_adapter_mode", "none"))
+        if mode != "none" and not adapter_loaded:
+            raise RuntimeError(
+                "Live generator checkpoint did not load any audio_adapter weights. "
+                f"audio_adapter_mode={mode!r} checkpoint={checkpoint_path}. "
+                "Use a checkpoint that already contains the bridge/adapter weights."
+            )
+        print(
+            "[IMTalker] generator load: "
+            f"checkpoint={checkpoint_path} "
+            f"loaded={len(loadable)} "
+            f"adapter_mode={mode} "
+            f"adapter_params_loaded={len(adapter_loaded)} "
+            f"audio_projection_params_loaded={len(projection_loaded)} "
+            f"use_ema={bool(getattr(self.opt, 'use_ema', True))} "
+            f"ema_params_merged={ema_applied}"
+        )
+        if missing:
+            preview = ", ".join(missing[:8])
+            suffix = " ..." if len(missing) > 8 else ""
+            print(f"[IMTalker] generator missing keys ({len(missing)}): {preview}{suffix}")
+        if unexpected:
+            preview = ", ".join(unexpected[:8])
+            suffix = " ..." if len(unexpected) > 8 else ""
+            print(f"[IMTalker] generator unexpected keys ({len(unexpected)}): {preview}{suffix}")
+
+    def _load_renderer_weights(self, checkpoint_path: str) -> None:
+        renderer_ckpt = torch.load(checkpoint_path, map_location="cpu")["state_dict"]
+        ae_state_dict = {
+            k.replace("gen.", ""): v for k, v in renderer_ckpt.items() if k.startswith("gen.")
+        }
+        self.renderer.load_state_dict(ae_state_dict, strict=False)
+
+    @torch.no_grad()
+    def prepare_reference(self, ref_path: str) -> None:
+        image = self.data_processor.default_img_loader(ref_path)
+        if self.crop:
+            image = self.data_processor.process_img(image)
+        s_tensor = self.data_processor.transform(image).unsqueeze(0).to(self.device)
+        self.idle_frame = s_tensor[0].detach().cpu()
+        # Pre-converted idle frame for the fMP4 producer: H,W,3 uint8 in [0,255].
+        # ToTensor() gives [0,1], so a plain clamp(0,1)*255 round is correct here.
+        idle_u8 = (
+            self.idle_frame.clamp(0, 1).mul(255).round().to(torch.uint8)
+        )
+        self.idle_frame_uint8 = (
+            idle_u8.permute(1, 2, 0).contiguous().numpy()
+        )
+        self.f_r, self.g_r = self.renderer.dense_feature_encoder(s_tensor)
+        self.ref_x = self.renderer.latent_token_encoder(s_tensor)
+
+    @torch.no_grad()
+    def warmup(self, n_passes: int = 2) -> float:
+        """Run dummy chunks through generator+renderer to fill CUDA graph cache."""
+        t0 = time.perf_counter()
+        fake_pcm = torch.zeros(self.chunk_samples, dtype=torch.float32)
+        if self._av_resampler is not None:
+            with torch.no_grad():
+                _ = self._av_resampler(
+                    torch.zeros(1, int(self.mimi.sample_rate), device=self.device)
+                )
+        warmup_stream = torch.cuda.Stream(self.device)
+        for i in range(n_passes):
+            try:
+                self._mimi_reply_stream_ready = False
+                self._render_reply_chunk(
+                    fake_pcm,
+                    chunk_index=i,
+                    reply_generation=self._reply_generation,
+                    render_stream=warmup_stream,
+                )
+            except Exception as exc:
+                print(f"[IMTalker] warmup pass {i} error (non-fatal): {exc}")
+        self.fm_stream_state = None
+        self._frame_residual = 0.0
+        self._mimi_reply_stream_ready = False
+        self._next_chunk_index = 0
+        self._next_fm_chunk_index = 0
+        self._next_emit_chunk_index = 0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        self._prev_chunk_last_latent = None
+        self._prev_chunk_tail_latents = None
+        self._overlap_latents = None
+        elapsed = time.perf_counter() - t0
+        print(f"[IMTalker] warmup done ({n_passes} passes, {elapsed:.2f}s)")
+        return elapsed
+
+    def _align_raw_mimi_to_target_frames(
+        self, latents: torch.Tensor, target_frames: int
+    ) -> torch.Tensor:
+        if latents.shape[0] == target_frames:
+            return latents
+        aligned = F.interpolate(
+            latents.transpose(0, 1).unsqueeze(0),
+            size=target_frames,
+            mode="linear",
+            align_corners=True,
+        )[0].transpose(0, 1).contiguous()
+        return aligned
+
+    @staticmethod
+    def _mean_l2(x: torch.Tensor) -> float:
+        if x.numel() == 0:
+            return 0.0
+        return x.norm(dim=-1).mean().item()
+
+    @staticmethod
+    def _mean_delta(x: torch.Tensor) -> float:
+        if x.shape[0] < 2:
+            return 0.0
+        return (x[1:] - x[:-1]).norm(dim=-1).mean().item()
+
+    def _ensure_mimi_streaming(self) -> None:
+        if getattr(self.mimi, "_streaming_state", None) is None:
+            self.mimi.streaming_forever(1)
+        if not self._mimi_reply_stream_ready:
+            self.mimi.reset_streaming()
+            self._mimi_reply_stream_ready = True
+
+    def _target_frames_for_pcm(self, pcm_num_samples: int) -> int:
+        exact = (pcm_num_samples * float(self.opt.fps) / float(self.mimi.sample_rate)) + self._frame_residual
+        target_frames = max(1, int(exact))
+        self._frame_residual = exact - target_frames
+        return target_frames
+
+    @torch.no_grad()
+    def _encode_reply_pcm_to_latents(
+        self,
+        pcm: torch.Tensor,
+        *,
+        original_num_samples: int | None = None,
+    ) -> torch.Tensor:
+        pcm = pcm.detach().cpu().float().reshape(-1)
+        if pcm.numel() == 0:
+            return torch.zeros((0, self.opt.audio_feat_dim), dtype=torch.float32)
+
+        self._ensure_mimi_streaming()
+        if original_num_samples is None:
+            original_num_samples = int(pcm.numel())
+        if self._mimi_pcm_residual.numel() > 0:
+            pcm = torch.cat([self._mimi_pcm_residual, pcm], dim=0)
+        total = pcm.numel()
+        full_samples = (total // self.mimi_frame_size) * self.mimi_frame_size
+        remainder = total - full_samples
+        if self.debug_session:
+            print(
+                "[DBG/mimi] "
+                f"orig_samples={int(original_num_samples)} "
+                f"total_with_residual={total} "
+                f"full_samples={full_samples} "
+                f"remainder={remainder}"
+            )
+        if full_samples == 0:
+            self._mimi_pcm_residual = pcm.clone()
+            return torch.zeros((0, self.opt.audio_feat_dim), dtype=torch.float32)
+
+        wav = pcm[:full_samples].unsqueeze(0).unsqueeze(0).to(self.device)
+        latent = self.mimi.encode_to_latent(wav, quantize=False)[0]
+        latent = latent.transpose(0, 1).contiguous().cpu()
+        self._mimi_pcm_residual = pcm[full_samples:].clone()
+        return latent
+
+    @torch.no_grad()
+    def _decode_sample_to_frames(self, sample: torch.Tensor) -> torch.Tensor:
+        total_frames = sample.shape[1]
+        batch_size = getattr(self, "_render_batch_size", 4)
+
+        ta_r = self.renderer.adapt(self.ref_x, self.g_r)
+        m_r = self.renderer.latent_token_decoder(ta_r)
+
+        g_r_exp = self.g_r.expand(total_frames, -1)
+        sample_flat = sample.squeeze(0)
+        ta_c_all = self.renderer.adapt(sample_flat, g_r_exp)
+        m_c_all = self.renderer.latent_token_decoder(ta_c_all)
+
+        all_frames = []
+        for start in range(0, total_frames, batch_size):
+            end = min(start + batch_size, total_frames)
+            bs = end - start
+            m_c_batch = tuple(m[start:end] for m in m_c_all)
+            m_r_batch = tuple(m.expand(bs, -1, -1, -1) for m in m_r)
+            f_r_batch = [f.expand(bs, -1, -1, -1) for f in self.f_r]
+            out = self.renderer.decode(m_c_batch, m_r_batch, f_r_batch).clone()
+            all_frames.append(out)
+
+        return torch.cat(all_frames, dim=0)
+
+    @torch.no_grad()
+    def _render_reply_chunk(
+        self,
+        pcm_chunk: torch.Tensor,
+        *,
+        chunk_index: int,
+        reply_generation: int,
+        render_stream: torch.cuda.Stream,
+        original_num_samples: int | None = None,
+    ) -> RenderedChunk:
+        t_chunk_start = time.perf_counter()
+        render_num_samples = int(original_num_samples or pcm_chunk.numel())
+        with self._fm_cv:
+            while (
+                chunk_index != self._next_fm_chunk_index
+                and not self._render_stop.is_set()
+                and reply_generation == self._reply_generation
+            ):
+                self._fm_cv.wait(timeout=0.05)
+            if reply_generation != self._reply_generation:
+                raise RuntimeError("Skipping stale reply chunk")
+            if self._render_stop.is_set():
+                raise RuntimeError("Render worker stopping")
+
+            with torch.cuda.stream(render_stream):
+                if self.debug_session:
+                    pcm_dbg = pcm_chunk[:render_num_samples].detach().float()
+                    rms = pcm_dbg.pow(2).mean().sqrt().item() if pcm_dbg.numel() else 0.0
+                    peak = pcm_dbg.abs().max().item() if pcm_dbg.numel() else 0.0
+                    print(
+                        "[DBG/pcm] "
+                        f"idx={chunk_index} "
+                        f"dur_sec={render_num_samples / self.mimi.sample_rate:.3f} "
+                        f"rms={rms:.5f} "
+                        f"peak={peak:.5f}"
+                    )
+                t0 = time.perf_counter()
+                latents = self._encode_reply_pcm_to_latents(
+                    pcm_chunk,
+                    original_num_samples=render_num_samples,
+                )
+                t_mimi = time.perf_counter() - t0
+                if latents.shape[0] == 0:
+                    raise RuntimeError("Cannot render empty reply chunk")
+
+                target_frames = self._target_frames_for_pcm(render_num_samples)
+                max_overlap_frames = max(self.render_window_frames - target_frames, 0)
+                overlap_frames = min(self.overlap_frames, max_overlap_frames)
+                overlap_context_latents = None
+                if self.overlap_context_latent_count > 0 and self._overlap_latents is not None:
+                    overlap_context_latents = torch.cat([self._overlap_latents, latents], dim=0)
+                used_overlap_context = (
+                    overlap_context_latents is not None
+                    and overlap_context_latents.shape[0] >= self.overlap_context_latent_count
+                )
+                latents_for_align = latents
+                if used_overlap_context:
+                    latents_for_align = overlap_context_latents
+                elif overlap_frames > 0:
+                    overlap_frames = 0
+
+                aligned_chunk = self._align_raw_mimi_to_target_frames(
+                    latents_for_align, target_frames + overlap_frames
+                )
+                if self.debug_session:
+                    print(
+                        "[DBG/chunk] "
+                        f"idx={chunk_index} "
+                        f"render_num_samples={render_num_samples} "
+                        f"raw_latent_T={latents.shape[0]} "
+                        f"target_frames={target_frames} "
+                        f"max_overlap_frames={max_overlap_frames} "
+                        f"overlap_frames_used={overlap_frames} "
+                        f"used_overlap_context={used_overlap_context} "
+                        f"aligned_T={aligned_chunk.shape[0]} "
+                        f"short_vs_window={self.render_window_frames - aligned_chunk.shape[0]}"
+                    )
+                    head = aligned_chunk[: min(5, aligned_chunk.shape[0])]
+                    tail = aligned_chunk[-min(5, aligned_chunk.shape[0]):]
+                    mid = aligned_chunk.shape[0] // 2
+                    first_half = aligned_chunk[: max(2, mid)]
+                    second_half = aligned_chunk[max(0, mid - 1) :]
+                    print(
+                        "[DBG/cond] "
+                        f"idx={chunk_index} "
+                        f"head_norm={self._mean_l2(head):.4f} "
+                        f"tail_norm={self._mean_l2(tail):.4f} "
+                        f"first_half_delta={self._mean_delta(first_half):.4f} "
+                        f"second_half_delta={self._mean_delta(second_half):.4f}"
+                    )
+                if self.overlap_context_latent_count > 0:
+                    if self._overlap_latents is None:
+                        overlap_tail = latents
+                    else:
+                        overlap_tail = torch.cat([self._overlap_latents, latents], dim=0)
+                    self._overlap_latents = overlap_tail[-self.overlap_context_latent_count:].clone()
+                else:
+                    self._overlap_latents = None
+
+                t0 = time.perf_counter()
+                sample_kwargs = {
+                    "a_cfg_scale": self.a_cfg_scale,
+                    "nfe": self.nfe,
+                }
+                sample_inputs = {
+                    "ref_x": self.ref_x,
+                    "a_feat": aligned_chunk.to(self.device),
+                    "gaze": self._static_condition_seq(self.static_gaze, aligned_chunk.shape[0]),
+                    "pose": self._static_condition_seq(self.static_pose, aligned_chunk.shape[0]),
+                    "cam": self._static_condition_seq(self.static_cam, aligned_chunk.shape[0]),
+                    "debug_chunk_index": chunk_index,
+                }
+                if self.use_stream_state:
+                    sample, next_state = self.fm.sample(
+                        sample_inputs,
+                        stream_state=self.fm_stream_state,
+                        return_state=True,
+                        **sample_kwargs,
+                    )
+                    self.fm_stream_state = next_state
+                else:
+                    sample = self.fm.sample(
+                        sample_inputs,
+                        stream_state=None,
+                        return_state=False,
+                        **sample_kwargs,
+                    )
+                render_stream.synchronize()
+                t_generator = time.perf_counter() - t0
+                if overlap_frames > 0:
+                    sample = sample[:, overlap_frames:, :]
+                    aligned_chunk = aligned_chunk[overlap_frames:, :]
+                blend_n = min(
+                    self.boundary_blend_frames,
+                    sample.shape[1],
+                    0 if self._prev_chunk_tail_latents is None else self._prev_chunk_tail_latents.shape[0],
+                )
+                if blend_n > 0:
+                    alpha = torch.linspace(
+                        0.0,
+                        1.0,
+                        blend_n + 2,
+                        device=sample.device,
+                        dtype=sample.dtype,
+                    )[1:-1].view(1, blend_n, 1)
+                    prev_tail = (
+                        self._prev_chunk_tail_latents[-blend_n:]
+                        .to(device=sample.device, dtype=sample.dtype)
+                        .unsqueeze(0)
+                    )
+                    sample[:, :blend_n, :] = (
+                        (1.0 - alpha) * prev_tail + alpha * sample[:, :blend_n, :]
+                    )
+
+            boundary_l2 = None
+            first_latent = sample[0, 0].detach().cpu()
+            if self._prev_chunk_last_latent is not None:
+                boundary_l2 = torch.norm(first_latent - self._prev_chunk_last_latent).item()
+            if self.debug_session:
+                prev_tail_mean = (
+                    self._prev_chunk_tail_latents[-blend_n:].norm(dim=-1).mean().item()
+                    if (blend_n > 0 and self._prev_chunk_tail_latents is not None)
+                    else -1.0
+                )
+                new_head_mean = sample[0, : max(1, blend_n)].norm(dim=-1).mean().item()
+                print(
+                    "[DBG/boundary] "
+                    f"idx={chunk_index} "
+                    f"blend_n={blend_n} "
+                    f"boundary_l2={boundary_l2 if boundary_l2 is not None else -1.0:.4f} "
+                    f"prev_tail_mean_norm={prev_tail_mean:.4f} "
+                    f"new_head_mean_norm={new_head_mean:.4f}"
+                )
+            self._prev_chunk_last_latent = sample[0, -1].detach().cpu().clone()
+            tail_keep = max(self.boundary_blend_frames, 1)
+            self._prev_chunk_tail_latents = sample[0, -tail_keep:].detach().cpu().clone()
+            self._next_fm_chunk_index += 1
+            self._fm_cv.notify_all()
+
+        with torch.cuda.stream(render_stream):
+            t0 = time.perf_counter()
+            frames = self._decode_sample_to_frames(sample)
+            render_stream.synchronize()
+            t_renderer = time.perf_counter() - t0
+
+        t_done = time.perf_counter()
+        result = RenderedChunk(
+            chunk_index=chunk_index,
+            frames=frames.detach().cpu(),
+            sample_latents=sample.detach().cpu(),
+            conditioning_latents=aligned_chunk.detach().cpu(),
+            render_start_wall_ts=t_chunk_start,
+            render_done_wall_ts=t_done,
+        )
+
+        t_total = t_done - t_chunk_start
+        boundary_msg = "" if boundary_l2 is None else f"  boundary_l2={boundary_l2:.3f}"
+        print(
+            f"[TIMING] chunk {result.chunk_index:03d} | "
+            f"mimi_encode={t_mimi:.3f}s  generator={t_generator:.3f}s  "
+            f"renderer={t_renderer:.3f}s  total={t_total:.3f}s  ({target_frames} frames)"
+            f"{boundary_msg}"
+        )
+        return result
+
+    # ---------------------------------------------------------------- #
+    # av_session push path
+    # ---------------------------------------------------------------- #
+    def _push_to_av(self, rendered: RenderedChunk, pcm24k_t: torch.Tensor) -> None:
+        """Convert a rendered chunk and push it to the active fMP4 session.
+
+        Skips silently if no viewer is connected.
+        """
+        av = self.av_session
+        if av is None:
+            return
+        frames_t = rendered.frames
+        # frames: [N,3,H,W] in [0,1] on CPU. Convert to [N,H,W,3] uint8.
+        x = frames_t.detach().clamp(0, 1).mul(255).round().to(torch.uint8)
+        frames_np = x.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+
+        # Resample mimi-rate float PCM (24 kHz) to 48 kHz int16 mono.
+        pcm48 = pcm24k_t.detach().to(self.device, dtype=torch.float32).reshape(-1)
+        if self._av_resampler is not None:
+            with torch.no_grad():
+                pcm48 = self._av_resampler(pcm48.unsqueeze(0)).squeeze(0)
+        target_audio_samples = int(frames_np.shape[0] * self._av_samples_per_frame)
+        if pcm48.shape[0] > target_audio_samples:
+            pcm48 = pcm48[:target_audio_samples]
+        elif pcm48.shape[0] < target_audio_samples:
+            pcm48 = F.pad(pcm48, (0, target_audio_samples - pcm48.shape[0]))
+        pcm48_int16 = (
+            pcm48.clamp(-1.0, 1.0).mul(32767.0).to(torch.int16).cpu().numpy()
+        )
+        self._reply_chunks_pushed += 1
+        now = time.perf_counter()
+        render_queue_wait = max(rendered.render_start_wall_ts - rendered.enqueue_wall_ts, 0.0)
+        render_to_push = max(now - rendered.render_done_wall_ts, 0.0)
+        chunk_age = max(now - rendered.enqueue_wall_ts, 0.0)
+        if self.debug_session:
+            frame_sec = frames_np.shape[0] / max(float(self.opt.fps), 1.0)
+            audio_sec = pcm48_int16.shape[0] / max(float(self._av_audio_sample_rate), 1.0)
+            delta_ms = (audio_sec - frame_sec) * 1000.0
+            av_state = av.debug_state() if hasattr(av, "debug_state") else {}
+            print(
+                f"[DEBUG/imtalker] push_av | chunk={self._reply_chunks_pushed - 1:03d} "
+                f"frames={frames_np.shape[0]} video={frame_sec:.3f}s "
+                f"audio={audio_sec:.3f}s delta={delta_ms:+.1f}ms "
+                f"play_q={av_state.get('play_queue_len', '?')} av_q={av_state.get('av_q_size', '?')} "
+                f"queue_wait={render_queue_wait:.3f}s render_to_push={render_to_push:.3f}s "
+                f"chunk_age={chunk_age:.3f}s"
+            )
+        av.push_chunk(
+            frames_np,
+            pcm48_int16,
+            meta={
+                "chunk_index": rendered.chunk_index,
+                "enqueue_wall_ts": rendered.enqueue_wall_ts,
+                "render_start_wall_ts": rendered.render_start_wall_ts,
+                "render_done_wall_ts": rendered.render_done_wall_ts,
+                "push_wall_ts": now,
+            },
+        )
+
+    def debug_state(self) -> dict:
+        elapsed = max(time.perf_counter() - self._reply_wall_t0, 0.0) if self._reply_wall_t0 else 0.0
+        generated_sec = self._reply_pcm_generated / max(float(self.mimi.sample_rate), 1.0)
+        return {
+            "render_queue_len": self._render_queue.qsize(),
+            "max_render_queue": self._max_render_queue,
+            "reply_pcm_buffer_samples": int(self._reply_pcm_buffer.numel()),
+            "reply_pcm_generated_samples": int(self._reply_pcm_generated),
+            "reply_generated_sec": round(generated_sec, 3),
+            "reply_elapsed_sec": round(elapsed, 3),
+            "generation_rate_x": round(generated_sec / elapsed, 3) if elapsed > 0 else 0.0,
+            "chunks_enqueued": self._reply_chunks_enqueued,
+            "chunks_rendered": self._reply_chunks_rendered,
+            "chunks_pushed": self._reply_chunks_pushed,
+            "frame_residual": round(self._frame_residual, 6),
+        }
+
+    def reset_reply(self) -> None:
+        """Drop any pending state from a prior Moshi turn.
+
+        Called when a new Moshi WS connection starts (so the next reply renders
+        with a fresh fm_stream_state). The render worker keeps running across
+        turns; any chunk currently being rendered finishes naturally, but no
+        further chunks from the prior turn will be enqueued.
+        """
+        while True:
+            try:
+                self._render_queue.get_nowait()
+            except _queue_mod.Empty:
+                break
+        self._reply_generation += 1
+        with self._fm_cv:
+            self._next_fm_chunk_index = 0
+            self._fm_cv.notify_all()
+        with self._emit_lock:
+            self._ready_chunks.clear()
+            self._next_emit_chunk_index = 0
+        self.fm_stream_state = None
+        self._frame_residual = 0.0
+        self._mimi_reply_stream_ready = False
+        self._mimi_pcm_residual = torch.zeros((0,), dtype=torch.float32)
+        if getattr(self.mimi, "_streaming_state", None) is not None:
+            self.mimi.reset_streaming()
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        self._reply_wall_t0 = 0.0
+        self._reply_pcm_generated = 0
+        self._reply_chunks_enqueued = 0
+        self._reply_chunks_rendered = 0
+        self._reply_chunks_pushed = 0
+        self._dump_reply_pcm_chunks = []
+        self._dump_reply_latent_chunks = []
+        self._max_render_queue = 0
+        self._prev_chunk_last_latent = None
+        self._prev_chunk_tail_latents = None
+        self._next_chunk_index = 0
+        self._overlap_latents = None
+
+    def _enqueue_chunk(self, chunk: torch.Tensor, *, valid_samples: int | None = None) -> None:
+        if valid_samples is None:
+            valid_samples = int(chunk.numel())
+        chunk_index = self._next_chunk_index
+        self._next_chunk_index += 1
+        self._render_queue.put(
+            PendingRenderChunk(
+                chunk_index=chunk_index,
+                reply_generation=self._reply_generation,
+                pcm=chunk,
+                valid_samples=int(valid_samples),
+                enqueue_wall_ts=time.perf_counter(),
+            )
+        )
+        self._reply_chunks_enqueued += 1
+        self._max_render_queue = max(self._max_render_queue, self._render_queue.qsize())
+
+    def _record_reply_dump_chunk(self, flat_pcm: torch.Tensor, latents: torch.Tensor) -> None:
+        if self.dump_reply_dir is None:
+            return
+        self._dump_reply_pcm_chunks.append(flat_pcm.detach().cpu().float().reshape(-1))
+        self._dump_reply_latent_chunks.append(latents.detach().cpu())
+
+    def _flush_reply_dump(self) -> None:
+        if self.dump_reply_dir is None or not self._dump_reply_pcm_chunks:
+            return
+
+        reply_id = max(self._reply_generation - 1, 0)
+        stem = f"reply_{reply_id:03d}"
+        wav_path = self.dump_reply_dir / f"{stem}.wav"
+        latents_path = self.dump_reply_dir / f"{stem}_latents.pt"
+
+        pcm = torch.cat(self._dump_reply_pcm_chunks, dim=0).unsqueeze(0)
+        torchaudio.save(str(wav_path), pcm, int(self.mimi.sample_rate))
+
+        latent_payload = {
+            "reply_id": reply_id,
+            "mimi_sample_rate": int(self.mimi.sample_rate),
+            "mimi_frame_rate": int(self.mimi.frame_rate),
+            "num_chunks": len(self._dump_reply_latent_chunks),
+        }
+        try:
+            latent_payload["latents"] = torch.cat(self._dump_reply_latent_chunks, dim=-1)
+        except Exception:
+            latent_payload["latents"] = self._dump_reply_latent_chunks
+            latent_payload["chunk_shapes"] = [
+                tuple(chunk.shape) for chunk in self._dump_reply_latent_chunks
+            ]
+        torch.save(latent_payload, latents_path)
+
+        if self.debug_session:
+            print(
+                f"[DBG/dump] saved_reply | wav={wav_path} "
+                f"latents={latents_path} samples={pcm.shape[-1]} "
+                f"latent_chunks={len(self._dump_reply_latent_chunks)}"
+            )
+
+    def _enqueue_ready_chunks(self) -> None:
+        """Slice _reply_pcm_buffer into chunk_samples-sized renderable chunks."""
+        while self._reply_pcm_buffer.numel() >= self.chunk_samples:
+            chunk = self._reply_pcm_buffer[: self.chunk_samples].clone()
+            self._reply_pcm_buffer = self._reply_pcm_buffer[self.chunk_samples :]
+            self._enqueue_chunk(chunk)
+
+    def _flush_ready_chunks_locked(self) -> None:
+        while True:
+            ready = self._ready_chunks.pop(self._next_emit_chunk_index, None)
+            if ready is None:
+                break
+            rendered, pcm_for_push = ready
+            self._push_to_av(rendered, pcm_for_push)
+            if self.debug_session:
+                print(
+                    f"[DEBUG/imtalker] emit_done | pushed_idx={self._next_emit_chunk_index:03d} "
+                    f"queue_remaining={self._render_queue.qsize()} pushed={self._reply_chunks_pushed}"
+                )
+            self._next_emit_chunk_index += 1
+
+    def _render_worker_loop(self, worker_id: int) -> None:
+        worker_stream = torch.cuda.Stream(self.device)
+        while not self._render_stop.is_set():
+            try:
+                pending = self._render_queue.get(timeout=0.1)
+            except _queue_mod.Empty:
+                continue
+            pcm_chunk = pending.pcm
+            chunk_samples = int(pending.valid_samples)
+            padded_samples = int(pcm_chunk.numel())
+            if self.debug_session:
+                print(
+                    f"[DEBUG/imtalker] render_start[{worker_id}] | queue_before={self._render_queue.qsize() + 1} "
+                    f"queue_after_pop={self._render_queue.qsize()} chunk_samples={chunk_samples} "
+                    f"padded_samples={padded_samples}"
+                )
+            try:
+                rendered = self._render_reply_chunk(
+                    pcm_chunk,
+                    chunk_index=pending.chunk_index,
+                    reply_generation=pending.reply_generation,
+                    render_stream=worker_stream,
+                    original_num_samples=chunk_samples,
+                )
+                rendered.enqueue_wall_ts = pending.enqueue_wall_ts
+            except Exception as exc:
+                print(f"[IMTalker] render error: {exc}")
+                continue
+            with self._emit_lock:
+                if pending.reply_generation != self._reply_generation:
+                    continue
+                self._reply_chunks_rendered += 1
+                self._ready_chunks[pending.chunk_index] = (
+                    rendered,
+                    pcm_chunk[:chunk_samples],
+                )
+                if self.debug_session:
+                    print(
+                        f"[DEBUG/imtalker] render_done[{worker_id}] | rendered={self._reply_chunks_rendered} "
+                        f"ready={len(self._ready_chunks)} queue_remaining={self._render_queue.qsize()}"
+                    )
+                self._flush_ready_chunks_locked()
+
+    def _ensure_render_worker(self) -> None:
+        alive = [t for t in self._render_threads if t.is_alive()]
+        self._render_threads = alive
+        if len(self._render_threads) >= self.render_workers:
+            return
+        self._render_stop.clear()
+        while len(self._render_threads) < self.render_workers:
+            worker_id = len(self._render_threads)
+            t = threading.Thread(
+                target=self._render_worker_loop,
+                args=(worker_id,),
+                daemon=True,
+                name=f"imtalker-render-{worker_id}",
+            )
+            t.start()
+            self._render_threads.append(t)
+
+    async def handle_moshi_output(
+        self, tokens: torch.Tensor, pcm: torch.Tensor, latents: torch.Tensor
+    ) -> list[RenderedChunk]:
+        """Buffer Moshi reply PCM and enqueue chunks for the render worker."""
+        del tokens
+        flat_pcm = pcm.detach().cpu().float().reshape(-1)
+        self._record_reply_dump_chunk(flat_pcm, latents)
+        # No viewer connected -> drop the PCM. Saves GPU and avoids growing
+        # fm_stream_state context for an audience that isn't there.
+        if self.av_session is None:
+            return []
+        if self._reply_wall_t0 == 0.0:
+            self._reply_wall_t0 = time.perf_counter()
+        self._reply_pcm_generated += int(flat_pcm.numel())
+        self._reply_pcm_buffer = torch.cat([self._reply_pcm_buffer, flat_pcm], dim=0)
+        queue_before = self._render_queue.qsize()
+        self._enqueue_ready_chunks()
+        queue_after = self._render_queue.qsize()
+        if queue_after > queue_before:
+            buffered_sec = self._reply_pcm_buffer.numel() / self.mimi.sample_rate
+            elapsed = max(time.perf_counter() - self._reply_wall_t0, 1e-6)
+            generated_sec = self._reply_pcm_generated / self.mimi.sample_rate
+            msg = (
+                f"[TIMING] moshi_output | +{flat_pcm.numel()} samples | "
+                f"residual={buffered_sec:.2f}s | enqueued {queue_after - queue_before} chunk(s) | "
+                f"render_queue={queue_after}"
+            )
+            if self.debug_session:
+                msg += (
+                    f" | generated={generated_sec:.2f}s wall={elapsed:.2f}s "
+                    f"rate={generated_sec / elapsed:.2f}x max_queue={self._max_render_queue}"
+                )
+            print(msg)
+        if not self._render_queue.empty():
+            self._ensure_render_worker()
+        return []
+
+    async def handle_user_audio(self, latents: torch.Tensor) -> list[RenderedChunk]:
+        del latents
+        return []
+
+    async def finalize_pending_reply(self) -> None:
+        """Flush any tail PCM into the render queue.
+
+        Does NOT block on the worker — the av_session keeps streaming idle
+        frames to the browser regardless, and the worker pushes the tail chunk
+        whenever the renderer finishes. This avoids blocking the Moshi WS
+        teardown on a slow render.
+        """
+        self._flush_reply_dump()
+        tail_samples = int(self._reply_pcm_buffer.numel())
+        if tail_samples == 0:
+            return
+        if self.av_session is None:
+            self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+            return
+        tail_sec = tail_samples / max(self.mimi.sample_rate, 1)
+        print(
+            f"[TIMING] finalize | tail_pcm={tail_samples} samples ({tail_sec:.2f}s) | "
+            f"queued_before_flush={self._render_queue.qsize()}"
+        )
+        chunk = self._reply_pcm_buffer.clone()
+        self._reply_pcm_buffer = torch.zeros((0,), dtype=torch.float32)
+        if tail_samples < self.chunk_samples:
+            chunk = F.pad(chunk, (0, self.chunk_samples - tail_samples))
+        self._enqueue_chunk(chunk, valid_samples=tail_samples)
+        self._ensure_render_worker()

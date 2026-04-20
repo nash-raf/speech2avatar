@@ -1,0 +1,516 @@
+[launch] Loading IMTalker session...
+Some weights of the model checkpoint at ./checkpoints/wav2vec2-base-960h were not used when initializing Wav2VecModel: ['wav2vec2.encoder.pos_conv_embed.conv.weight_v', 'lm_head.weight', 'lm_head.bias', 'wav2vec2.encoder.pos_conv_embed.conv.weight_g']
+- This IS expected if you are initializing Wav2VecModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing Wav2VecModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+Some weights of Wav2VecModel were not initialized from the model checkpoint at ./checkpoints/wav2vec2-base-960h and are newly initialized: ['wav2vec2.masked_spec_embed', 'wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original0', 'wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+
+[Model Stats] Parameters: 134,506,784 | Trainable: 40,135,072
+[IMTalker] generator load: checkpoint=/workspace/exps/phase2_bridge_finetune/checkpoints/step=050000.ckpt loaded=326 adapter_mode=bridge_to_768 adapter_params_loaded=6 audio_projection_params_loaded=4 use_ema=True ema_params_merged=6
+/workspace/moshi/moshi/moshi/models/loaders.py:204: UserWarning: Repository kyutai/moshiko-pytorch-bf16 contains no config.json. Assuming this is a Moshi 7B. Support for such repository might be removed in the future.
+  warnings.warn(
+[DBG/config] ws_audio_buffer_ms=80.0 chunk_sec=1.0 chunk_samples=24000 mimi_sr=24000 mimi_fr=12.5 render_window_frames=50 emit_step_frames=25 overlap_frames=25 overlap_latent_count=12 overlap_context_latent_count=24 boundary_blend_frames=4 use_stream_state=True nfe=5 a_cfg_scale=1.0 wav2vec_sec=2 fps=25.0 num_prev_frames=10
+[DBG/pcm] idx=0 dur_sec=1.000 rms=0.00000 peak=0.00000
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=0 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=0 head_norm=1.3213 tail_norm=1.4767 first_half_delta=0.2406 second_half_delta=0.1137
+[DBG/x0] idx=0 carry_frames=0 head_norm=5.5308
+[DBG/boundary] idx=0 blend_n=0 boundary_l2=-1.0000 prev_tail_mean_norm=-1.0000 new_head_mean_norm=51.4683
+[TIMING] chunk 000 | mimi_encode=0.132s  generator=0.039s  renderer=7.573s  total=7.746s  (25 frames)
+[DBG/pcm] idx=1 dur_sec=1.000 rms=0.00000 peak=0.00000
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=1 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=1 head_norm=1.3336 tail_norm=1.4816 first_half_delta=0.2578 second_half_delta=0.1115
+[DBG/x0] idx=1 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=1 blend_n=4 boundary_l2=0.1455 prev_tail_mean_norm=51.8432 new_head_mean_norm=51.8160
+[TIMING] chunk 001 | mimi_encode=0.084s  generator=0.015s  renderer=0.306s  total=0.406s  (25 frames)  boundary_l2=0.146
+[IMTalker] warmup done (2 passes, 8.20s)
+[launch] IMTalker session ready.
+[launch] Loading Moshi checkpoint...
+[launch] Loading Moshi Mimi...
+[launch] Loading Moshi LM...
+[launch] Warming up Moshi...
+[launch] Using local Moshi client build: /workspace/moshi/client/dist
+[launch] WS viewer -> http://localhost:8998/
+[launch] Hidden Moshi UI -> http://localhost:8998/moshi
+[launch] WS stream route -> ws://localhost:8998/ws/stream
+
+======== Running on http://0.0.0.0:8998 ========
+(Press CTRL+C to quit)
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[1;34m[Info][0m accepted connection
+[1;34m[Info][0m session reset | max_sentences=6 max_text_tokens=200 frame_size=1920 mimi_sr=24000
+[1;34m[Info][0m text token ' Hi'
+[DEBUG/moshi] step | tokens=1/200 sentences=0/6
+[1;34m[Info][0m text token ','
+[DEBUG/moshi] step | tokens=2/200 sentences=0/6
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=25 mic_samples=24000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=1.04s wall=1.07s rate=0.97x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[1;34m[Info][0m text token ' how'
+[DEBUG/moshi] step | tokens=3/200 sentences=0/6
+[DBG/pcm] idx=0 dur_sec=1.000 rms=0.06792 peak=0.56412
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=0 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=0 head_norm=1.2924 tail_norm=1.6258 first_half_delta=0.4961 second_half_delta=0.5441
+[DBG/x0] idx=0 carry_frames=0 head_norm=5.5308
+[DBG/boundary] idx=0 blend_n=0 boundary_l2=-1.0000 prev_tail_mean_norm=-1.0000 new_head_mean_norm=51.4434
+[TIMING] chunk 000 | mimi_encode=0.065s  generator=0.053s  renderer=0.387s  total=0.507s  (25 frames)
+[DEBUG/imtalker] render_done[0] | rendered=1 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=000 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.001s render_to_push=0.087s chunk_age=0.595s
+[DEBUG/ws] push_chunk | idx=000 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=000 queue_remaining=0 pushed=1
+[1;34m[Info][0m text token ' is'
+[DEBUG/moshi] step | tokens=4/200 sentences=0/6
+[DBG/wsq] chunk=0 chunk_age=0.887s push_to_stream=0.291s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=27 frames_emitted=115 reply_ticks_emitted=0 idle_ticks_emitted=115 video_packets_sent=115 audio_packets_sent=230 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=0 chunk_age=0.887s push_to_stream=0.291s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=5.286s play_q=0 out_q=1
+[1;34m[Info][0m text token ' it'
+[DEBUG/moshi] step | tokens=5/200 sentences=0/6
+[1;34m[Info][0m text token ' going'
+[DEBUG/moshi] step | tokens=6/200 sentences=0/6
+[1;34m[Info][0m text token '?'
+[DEBUG/moshi] step | tokens=7/200 sentences=1/6
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=50 mic_samples=48000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=2.00s wall=2.67s rate=0.75x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=1 dur_sec=1.000 rms=0.07874 peak=0.66506
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=1 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=1 head_norm=1.4960 tail_norm=1.5435 first_half_delta=0.8221 second_half_delta=0.7277
+[DBG/x0] idx=1 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=1 blend_n=4 boundary_l2=0.1756 prev_tail_mean_norm=51.6631 new_head_mean_norm=52.0232
+[DEBUG/ws] mode -> idle | reply_for=1.103s play_q=0 out_q=33
+[TIMING] chunk 001 | mimi_encode=0.023s  generator=0.030s  renderer=0.321s  total=0.376s  (25 frames)  boundary_l2=0.176
+[DEBUG/imtalker] render_done[0] | rendered=2 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=001 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.101s chunk_age=0.477s
+[DEBUG/ws] push_chunk | idx=001 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=001 queue_remaining=0 pushed=2
+[DBG/wsq] chunk=1 chunk_age=0.745s push_to_stream=0.268s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=42 frames_emitted=143 reply_ticks_emitted=25 idle_ticks_emitted=118 video_packets_sent=143 audio_packets_sent=286 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=1 chunk_age=0.745s push_to_stream=0.268s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=0.359s play_q=0 out_q=1
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=75 mic_samples=72000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=3.04s wall=4.22s rate=0.72x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=2 dur_sec=1.000 rms=0.00156 peak=0.00459
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=2 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=2 head_norm=1.8590 tail_norm=1.6183 first_half_delta=0.2480 second_half_delta=0.1101
+[DBG/x0] idx=2 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=2 blend_n=4 boundary_l2=0.0577 prev_tail_mean_norm=51.8467 new_head_mean_norm=51.6608
+[TIMING] chunk 002 | mimi_encode=0.022s  generator=0.052s  renderer=0.332s  total=0.408s  (25 frames)  boundary_l2=0.058
+[DEBUG/imtalker] render_done[0] | rendered=3 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=002 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.127s chunk_age=0.535s
+[DEBUG/ws] push_chunk | idx=002 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=002 queue_remaining=0 pushed=3
+[DBG/wsq] chunk=2 chunk_age=0.617s push_to_stream=0.083s play_queue_len=0 max_play_queue=1 out_q_size=13 max_out_q=42 frames_emitted=168 reply_ticks_emitted=50 idle_ticks_emitted=118 video_packets_sent=168 audio_packets_sent=336 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=2 chunk_age=0.617s push_to_stream=0.083s play_q=0 out_q=13
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=100 mic_samples=96000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=4.00s wall=5.63s rate=0.71x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=3 dur_sec=1.000 rms=0.00122 peak=0.00275
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=3 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=3 head_norm=1.6081 tail_norm=1.5515 first_half_delta=0.1213 second_half_delta=0.1348
+[DBG/x0] idx=3 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=3 blend_n=4 boundary_l2=0.1135 prev_tail_mean_norm=51.3154 new_head_mean_norm=51.2913
+[TIMING] chunk 003 | mimi_encode=0.030s  generator=0.064s  renderer=0.340s  total=0.437s  (25 frames)  boundary_l2=0.114
+[DEBUG/imtalker] render_done[0] | rendered=4 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=003 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.104s chunk_age=0.541s
+[DEBUG/ws] push_chunk | idx=003 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=003 queue_remaining=0 pushed=4
+[DBG/wsq] chunk=3 chunk_age=0.719s push_to_stream=0.178s play_queue_len=0 max_play_queue=1 out_q_size=16 max_out_q=42 frames_emitted=193 reply_ticks_emitted=75 idle_ticks_emitted=118 video_packets_sent=193 audio_packets_sent=386 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=3 chunk_age=0.719s push_to_stream=0.178s play_q=0 out_q=16
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=125 mic_samples=120000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=5.04s wall=7.24s rate=0.70x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=4 dur_sec=1.000 rms=0.00062 peak=0.00206
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=4 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=4 head_norm=1.5681 tail_norm=1.5629 first_half_delta=0.0637 second_half_delta=0.0897
+[DBG/x0] idx=4 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=4 blend_n=4 boundary_l2=0.0549 prev_tail_mean_norm=51.4432 new_head_mean_norm=51.4502
+[TIMING] chunk 004 | mimi_encode=0.018s  generator=0.031s  renderer=0.335s  total=0.384s  (25 frames)  boundary_l2=0.055
+[DEBUG/imtalker] render_done[0] | rendered=5 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=004 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.143s chunk_age=0.528s
+[DEBUG/ws] push_chunk | idx=004 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=004 queue_remaining=0 pushed=5
+[DBG/wsq] chunk=4 chunk_age=0.650s push_to_stream=0.122s play_queue_len=0 max_play_queue=1 out_q_size=13 max_out_q=42 frames_emitted=218 reply_ticks_emitted=100 idle_ticks_emitted=118 video_packets_sent=218 audio_packets_sent=436 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=4 chunk_age=0.650s push_to_stream=0.122s play_q=0 out_q=13
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=150 mic_samples=144000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=6.00s wall=8.80s rate=0.68x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=5 dur_sec=1.000 rms=0.00054 peak=0.00157
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=5 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=5 head_norm=1.5483 tail_norm=1.5669 first_half_delta=0.1025 second_half_delta=0.0503
+[DBG/x0] idx=5 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=5 blend_n=4 boundary_l2=0.1430 prev_tail_mean_norm=51.2563 new_head_mean_norm=51.3575
+[TIMING] chunk 005 | mimi_encode=0.018s  generator=0.038s  renderer=0.313s  total=0.370s  (25 frames)  boundary_l2=0.143
+[DEBUG/imtalker] render_done[0] | rendered=6 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=005 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.084s chunk_age=0.454s
+[DEBUG/ws] push_chunk | idx=005 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=005 queue_remaining=0 pushed=6
+[DBG/wsq] chunk=5 chunk_age=0.540s push_to_stream=0.086s play_queue_len=0 max_play_queue=1 out_q_size=13 max_out_q=42 frames_emitted=243 reply_ticks_emitted=125 idle_ticks_emitted=118 video_packets_sent=243 audio_packets_sent=486 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=5 chunk_age=0.540s push_to_stream=0.086s play_q=0 out_q=13
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=175 mic_samples=168000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=7.04s wall=10.34s rate=0.68x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=6 dur_sec=1.000 rms=0.00080 peak=0.00293
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=6 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=6 head_norm=1.5207 tail_norm=1.5912 first_half_delta=0.0948 second_half_delta=0.1136
+[DBG/x0] idx=6 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=6 blend_n=4 boundary_l2=0.0792 prev_tail_mean_norm=51.3898 new_head_mean_norm=51.4337
+[DEBUG/ws] mode -> idle | reply_for=7.132s play_q=0 out_q=12
+[TIMING] chunk 006 | mimi_encode=0.031s  generator=0.062s  renderer=0.338s  total=0.433s  (25 frames)  boundary_l2=0.079
+[DEBUG/imtalker] render_done[0] | rendered=7 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=006 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.098s chunk_age=0.531s
+[DEBUG/ws] push_chunk | idx=006 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=006 queue_remaining=0 pushed=7
+[DBG/wsq] chunk=6 chunk_age=0.744s push_to_stream=0.213s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=42 frames_emitted=274 reply_ticks_emitted=150 idle_ticks_emitted=124 video_packets_sent=274 audio_packets_sent=548 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=6 chunk_age=0.744s push_to_stream=0.213s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=0.534s play_q=0 out_q=1
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=200 mic_samples=192000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=8.00s wall=11.79s rate=0.68x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=7 dur_sec=1.000 rms=0.00071 peak=0.00243
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=7 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=7 head_norm=1.5537 tail_norm=1.5587 first_half_delta=0.0871 second_half_delta=0.0986
+[DBG/x0] idx=7 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=7 blend_n=4 boundary_l2=0.1389 prev_tail_mean_norm=51.3117 new_head_mean_norm=51.3832
+[TIMING] chunk 007 | mimi_encode=0.036s  generator=0.069s  renderer=0.343s  total=0.450s  (25 frames)  boundary_l2=0.139
+[DEBUG/imtalker] render_done[0] | rendered=8 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=007 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.116s chunk_age=0.567s
+[DEBUG/ws] push_chunk | idx=007 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=007 queue_remaining=0 pushed=8
+[DBG/wsq] chunk=7 chunk_age=0.792s push_to_stream=0.225s play_queue_len=0 max_play_queue=1 out_q_size=4 max_out_q=42 frames_emitted=299 reply_ticks_emitted=175 idle_ticks_emitted=124 video_packets_sent=299 audio_packets_sent=598 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=7 chunk_age=0.792s push_to_stream=0.225s play_q=0 out_q=4
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=225 mic_samples=216000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=9.04s wall=13.39s rate=0.68x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=8 dur_sec=1.000 rms=0.00057 peak=0.00205
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=8 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=8 head_norm=1.5544 tail_norm=1.6232 first_half_delta=0.0629 second_half_delta=0.1069
+[DBG/x0] idx=8 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=8 blend_n=4 boundary_l2=0.1315 prev_tail_mean_norm=51.3351 new_head_mean_norm=51.4181
+[TIMING] chunk 008 | mimi_encode=0.031s  generator=0.069s  renderer=0.343s  total=0.446s  (25 frames)  boundary_l2=0.132
+[DEBUG/imtalker] render_done[0] | rendered=9 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=008 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.001s render_to_push=0.129s chunk_age=0.575s
+[DEBUG/ws] push_chunk | idx=008 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=008 queue_remaining=0 pushed=9
+[DBG/wsq] chunk=8 chunk_age=0.711s push_to_stream=0.135s play_queue_len=0 max_play_queue=1 out_q_size=13 max_out_q=42 frames_emitted=324 reply_ticks_emitted=200 idle_ticks_emitted=124 video_packets_sent=324 audio_packets_sent=648 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=8 chunk_age=0.711s push_to_stream=0.135s play_q=0 out_q=13
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=250 mic_samples=240000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=10.00s wall=15.08s rate=0.66x max_queue=1[DEBUG/imtalker] render_start[1] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+
+[DBG/pcm] idx=9 dur_sec=1.000 rms=0.00040 peak=0.00121
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=9 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=9 head_norm=1.5632 tail_norm=1.6184 first_half_delta=0.0633 second_half_delta=0.0496
+[DBG/x0] idx=9 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=9 blend_n=4 boundary_l2=0.0842 prev_tail_mean_norm=51.4444 new_head_mean_norm=51.5564
+[TIMING] chunk 009 | mimi_encode=0.048s  generator=0.032s  renderer=0.376s  total=0.458s  (25 frames)  boundary_l2=0.084
+[DEBUG/imtalker] render_done[1] | rendered=10 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=009 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.091s chunk_age=0.549s
+[DEBUG/ws] push_chunk | idx=009 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=009 queue_remaining=0 pushed=10
+[DBG/wsq] chunk=9 chunk_age=0.722s push_to_stream=0.172s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=42 frames_emitted=349 reply_ticks_emitted=225 idle_ticks_emitted=124 video_packets_sent=349 audio_packets_sent=698 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=9 chunk_age=0.722s push_to_stream=0.172s play_q=0 out_q=1
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=275 mic_samples=264000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=11.04s wall=16.72s rate=0.66x max_queue=1
+[DEBUG/imtalker] render_start[1] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=10 dur_sec=1.000 rms=0.00048 peak=0.00156
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=10 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=10 head_norm=1.5845 tail_norm=1.5809 first_half_delta=0.0798 second_half_delta=0.0542
+[DBG/x0] idx=10 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=10 blend_n=4 boundary_l2=0.1063 prev_tail_mean_norm=51.4203 new_head_mean_norm=51.5009
+[DEBUG/ws] mode -> idle | reply_for=6.058s play_q=0 out_q=12
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[TIMING] chunk 010 | mimi_encode=0.023s  generator=0.059s  renderer=0.337s  total=0.421s  (25 frames)  boundary_l2=0.106
+[DEBUG/imtalker] render_done[1] | rendered=11 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=010 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.094s chunk_age=0.515s
+[DEBUG/ws] push_chunk | idx=010 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=010 queue_remaining=0 pushed=11
+[DBG/wsq] chunk=10 chunk_age=0.722s push_to_stream=0.207s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=42 frames_emitted=383 reply_ticks_emitted=250 idle_ticks_emitted=133 video_packets_sent=383 audio_packets_sent=766 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=10 chunk_age=0.722s push_to_stream=0.207s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=0.303s play_q=0 out_q=1
+[DEBUG/moshi] recv | mic_chunks=300 mic_samples=288000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=12.00s wall=18.07s rate=0.66x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=11 dur_sec=1.000 rms=0.00054 peak=0.00238
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=11 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=11 head_norm=1.7141 tail_norm=1.6490 first_half_delta=0.1114 second_half_delta=0.1496
+[DBG/x0] idx=11 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=11 blend_n=4 boundary_l2=0.1560 prev_tail_mean_norm=51.3402 new_head_mean_norm=51.4917
+[TIMING] chunk 011 | mimi_encode=0.037s  generator=0.061s  renderer=0.415s  total=0.515s  (25 frames)  boundary_l2=0.156
+[DEBUG/imtalker] render_done[0] | rendered=12 ready=1 queue_remaining=0
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/imtalker] push_av | chunk=011 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.092s chunk_age=0.607s
+[DEBUG/ws] push_chunk | idx=011 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=011 queue_remaining=0 pushed=12
+[DBG/wsq] chunk=11 chunk_age=0.609s push_to_stream=0.002s play_queue_len=0 max_play_queue=1 out_q_size=34 max_out_q=42 frames_emitted=408 reply_ticks_emitted=275 idle_ticks_emitted=133 video_packets_sent=408 audio_packets_sent=816 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=11 chunk_age=0.609s push_to_stream=0.002s play_q=0 out_q=34
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=325 mic_samples=312000 pending_pcm=0
+[TIMING] moshi_output | +1920 samples | residual=0.04s | enqueued 1 chunk(s) | render_queue=1 | generated=13.04s wall=19.67s rate=0.66x max_queue=1
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=12 dur_sec=1.000 rms=0.00045 peak=0.00168
+[DBG/mimi] orig_samples=24000 total_with_residual=24000 full_samples=23040 remainder=960
+[DBG/chunk] idx=12 render_num_samples=24000 raw_latent_T=12 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=12 head_norm=1.3445 tail_norm=1.3876 first_half_delta=0.0698 second_half_delta=0.0416
+[DBG/x0] idx=12 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=12 blend_n=4 boundary_l2=0.2785 prev_tail_mean_norm=51.7597 new_head_mean_norm=51.8364
+[DEBUG/ws] mode -> idle | reply_for=2.436s play_q=0 out_q=12
+[TIMING] chunk 012 | mimi_encode=0.027s  generator=0.050s  renderer=0.329s  total=0.408s  (25 frames)  boundary_l2=0.278
+[DEBUG/imtalker] render_done[0] | rendered=13 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=012 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.086s chunk_age=0.494s
+[DEBUG/ws] push_chunk | idx=012 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=012 queue_remaining=0 pushed=13
+[DBG/wsq] chunk=12 chunk_age=0.715s push_to_stream=0.221s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=42 frames_emitted=439 reply_ticks_emitted=300 idle_ticks_emitted=139 video_packets_sent=439 audio_packets_sent=878 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=12 chunk_age=0.715s push_to_stream=0.221s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=0.503s play_q=0 out_q=1
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/moshi] recv | mic_chunks=350 mic_samples=336000 pending_pcm=960
+[TIMING] moshi_output | +1920 samples | residual=0.00s | enqueued 1 chunk(s) | render_queue=1 | generated=14.00s wall=21.11s rate=0.66x max_queue=1
+[DEBUG/imtalker] render_start[1] | queue_before=1 queue_after_pop=0 chunk_samples=24000 padded_samples=24000
+[DBG/pcm] idx=13 dur_sec=1.000 rms=0.00034 peak=0.00106
+[DBG/mimi] orig_samples=24000 total_with_residual=24960 full_samples=24960 remainder=0
+[DBG/chunk] idx=13 render_num_samples=24000 raw_latent_T=13 target_frames=25 max_overlap_frames=25 overlap_frames_used=0 used_overlap_context=False aligned_T=25 short_vs_window=25
+[DBG/cond] idx=13 head_norm=1.4024 tail_norm=1.4095 first_half_delta=0.0350 second_half_delta=0.0337
+[DBG/x0] idx=13 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=13 blend_n=4 boundary_l2=0.2093 prev_tail_mean_norm=51.3401 new_head_mean_norm=51.4839
+[DEBUG/ws] mode -> idle | reply_for=1.116s play_q=0 out_q=33
+[TIMING] chunk 013 | mimi_encode=0.036s  generator=0.062s  renderer=0.419s  total=0.520s  (25 frames)  boundary_l2=0.209
+[DEBUG/imtalker] render_done[1] | rendered=14 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=013 frames=25 video=1.000s audio=1.000s delta=+0.0ms play_q=0 av_q=? queue_wait=0.001s render_to_push=0.094s chunk_age=0.615s
+[DEBUG/ws] push_chunk | idx=013 frames=25 video=1.000s audio=1.000s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=013 queue_remaining=0 pushed=14
+[DBG/wsq] chunk=13 chunk_age=0.878s push_to_stream=0.263s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=45 frames_emitted=468 reply_ticks_emitted=325 idle_ticks_emitted=143 video_packets_sent=468 audio_packets_sent=936 out_q_drops=0 mode=idle
+[DEBUG/ws] play_start | chunk=13 chunk_age=0.878s push_to_stream=0.263s play_q=0 out_q=1
+[DEBUG/ws] mode -> reply | idle_for=0.483s play_q=0 out_q=1
+/workspace/preprocess_5090/lib/python3.11/site-packages/torchaudio/_backend/utils.py:337: UserWarning: In 2.9, this function's implementation will be changed to use torchaudio.save_with_torchcodec` under the hood. Some parameters like format, encoding, bits_per_sample, buffer_size, and ``backend`` will be ignored. We recommend that you port your code to rely directly on TorchCodec's encoder instead: https://docs.pytorch.org/torchcodec/stable/generated/torchcodec.encoders.AudioEncoder
+  warnings.warn(
+/workspace/preprocess_5090/lib/python3.11/site-packages/torchaudio/_backend/ffmpeg.py:247: UserWarning: torio.io._streaming_media_encoder.StreamingMediaEncoder has been deprecated. This deprecation is part of a large refactoring effort to transition TorchAudio into a maintenance phase. The decoding and encoding capabilities of PyTorch for both audio and video are being consolidated into TorchCodec. Please see https://github.com/pytorch/audio/issues/3902 for more information. It will be removed from the 2.9 release. 
+  s = torchaudio.io.StreamWriter(uri, format=muxer, buffer_size=buffer_size)
+[DBG/dump] saved_reply | wav=/workspace/IMTalker/dump_reply/reply_001.wav latents=/workspace/IMTalker/dump_reply/reply_001_latents.pt samples=349440 latent_chunks=182
+[TIMING] finalize | tail_pcm=13440 samples (0.56s) | queued_before_flush=0
+[1;34m[Info][0m connection closed | elapsed=22.52s mic_chunks=366 mic_samples=351360 reply_sentences=1 reply_tokens=7 close_code=1000
+[DEBUG/moshi] session_summary | {'render_queue_len': 1, 'max_render_queue': 1, 'reply_pcm_buffer_samples': 0, 'reply_pcm_generated_samples': 349440, 'reply_generated_sec': 14.56, 'reply_elapsed_sec': 22.256, 'generation_rate_x': 0.654, 'chunks_enqueued': 15, 'chunks_rendered': 14, 'chunks_pushed': 14, 'frame_residual': 0.0}
+[1;34m[Info][0m done with connection
+[DEBUG/imtalker] render_start[0] | queue_before=1 queue_after_pop=0 chunk_samples=13440 padded_samples=24000
+[DBG/pcm] idx=14 dur_sec=0.560 rms=0.00036 peak=0.00111
+[DBG/mimi] orig_samples=13440 total_with_residual=24000 full_samples=23040 remainder=960
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DBG/chunk] idx=14 render_num_samples=13440 raw_latent_T=12 target_frames=14 max_overlap_frames=36 overlap_frames_used=0 used_overlap_context=False aligned_T=14 short_vs_window=36
+[DBG/cond] idx=14 head_norm=1.4000 tail_norm=1.3964 first_half_delta=0.1367 second_half_delta=0.0745
+[DBG/x0] idx=14 carry_frames=25 head_norm=4.7874
+[DBG/boundary] idx=14 blend_n=4 boundary_l2=0.1671 prev_tail_mean_norm=51.3314 new_head_mean_norm=51.4641
+[TIMING] chunk 014 | mimi_encode=0.022s  generator=0.029s  renderer=0.247s  total=0.300s  (14 frames)  boundary_l2=0.167
+[DEBUG/imtalker] render_done[0] | rendered=15 ready=1 queue_remaining=0
+[DEBUG/imtalker] push_av | chunk=014 frames=14 video=0.560s audio=0.560s delta=+0.0ms play_q=0 av_q=? queue_wait=0.000s render_to_push=0.053s chunk_age=0.354s
+[DEBUG/ws] push_chunk | idx=014 frames=14 video=0.560s audio=0.560s play_q=1
+[DEBUG/imtalker] emit_done | pushed_idx=014 queue_remaining=0 pushed=15
+[DBG/wsq] chunk=14 chunk_age=0.721s push_to_stream=0.367s play_queue_len=0 max_play_queue=1 out_q_size=1 max_out_q=45 frames_emitted=493 reply_ticks_emitted=350 idle_ticks_emitted=143 video_packets_sent=493 audio_packets_sent=986 out_q_drops=0 mode=reply
+[DEBUG/ws] play_start | chunk=14 chunk_age=0.721s push_to_stream=0.367s play_q=0 out_q=1
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[DEBUG/ws] mode -> idle | reply_for=1.556s play_q=0 out_q=0
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[VDEBUG] keyframe | extradata=None nal[:8]=000000016742c01e
+[launch/ws] client disconnected

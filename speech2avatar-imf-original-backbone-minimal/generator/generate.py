@@ -185,7 +185,8 @@ class InferenceAgent:
             data["gaze"] = None
 
         f_r, t_r, g_r = self.encode_image(data['s'].to(self.opt.rank))
-        data["ref_x"] = t_r
+        # Normalize ref_x into the training space (zero-mean, unit-var per dim)
+        data["ref_x"] = self.fm._normalize_motion(t_r)
         t2 = time.perf_counter()
 
         sample = self.fm.sample(

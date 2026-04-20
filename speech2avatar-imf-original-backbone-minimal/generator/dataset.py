@@ -18,9 +18,21 @@ class AudioMotionSmirkGazeDataset(Dataset):
         self.num_frames_for_clip = int(self.opt.wav2vec_sec * self.opt.fps)
         self.num_prev_frames = int(self.opt.num_prev_frames)
         self.required_len = self.num_frames_for_clip + self.num_prev_frames
-        
-        # Define subdirectories
+
+        # Load per-dimension motion normalization stats
         root_path = Path(opt.dataset_path)
+        stats_path = root_path / "motion_stats.pt"
+        if stats_path.exists():
+            stats = torch.load(stats_path, map_location="cpu")
+            self.motion_mean = stats["mean"]  # (32,)
+            self.motion_std = stats["std"]    # (32,)
+            print(f"[Info] Loaded motion normalization stats from {stats_path}")
+        else:
+            self.motion_mean = None
+            self.motion_std = None
+            print(f"[Warning] No motion_stats.pt found at {stats_path}, skipping normalization")
+
+        # Define subdirectories
         motion_dir = root_path / "motion"
         audio_dir = root_path / "audio"
         smirk_dir = root_path / "smirk"
@@ -78,6 +90,12 @@ class AudioMotionSmirkGazeDataset(Dataset):
             raise RuntimeError(f"No valid samples found in {root_path}")
         print(f"[Info] Collected {len(self.samples)} valid samples.")
 
+    def _normalize_motion(self, m):
+        """Normalize motion latents to zero-mean, unit-variance per dimension."""
+        if self.motion_mean is not None:
+            return (m - self.motion_mean) / self.motion_std
+        return m
+
     def __len__(self):
         return len(self.samples)
 
@@ -95,7 +113,7 @@ class AudioMotionSmirkGazeDataset(Dataset):
         end_idx = start_idx + self.required_len
 
         audio_seg = torch.from_numpy(audio[start_idx:end_idx].copy()).float()
-        motion_seg = motion[start_idx:end_idx]
+        motion_seg = self._normalize_motion(motion[start_idx:end_idx])
         gaze_seg = torch.from_numpy(gaze[start_idx:end_idx].copy()).float()
         pose_seg = pose[start_idx:end_idx]
         cam_seg = cam[start_idx:end_idx]

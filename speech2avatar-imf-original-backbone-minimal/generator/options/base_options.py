@@ -46,6 +46,7 @@ class BaseOptions():
 		parser.add_argument('--aux_head_depth', default=4, type=int)
 		parser.add_argument('--num_heads', default=8, type=int)
 		parser.add_argument('--mlp_ratio', default=4.0, type=float)
+		parser.add_argument('--drop_path_rate', default=0.1, type=float, help='Stochastic depth rate')
 		parser.add_argument('--no_learned_pe', action='store_true')
 		parser.add_argument('--num_prev_frames', type=int, default=10)
 		parser.add_argument('--max_grad_norm', default=1, type=float, help='max grad norm for training transformers')
@@ -60,6 +61,10 @@ class BaseOptions():
 		parser.add_argument('--cfg_beta', default=1.0, type=float)
 		parser.add_argument('--norm_p', default=1.0, type=float)
 		parser.add_argument('--norm_eps', default=0.01, type=float)
+		parser.add_argument('--lambda_vel', default=0.05, type=float,
+							help='Temporal velocity smoothness loss weight')
+		parser.add_argument('--prev_dropout_prob', default=0.5, type=float,
+							help='Dropout probability for previous-context signals')
 
 		parser.add_argument('--ode_atol', default=1e-5, type=float)
 		parser.add_argument('--ode_rtol', default=1e-5, type=float)

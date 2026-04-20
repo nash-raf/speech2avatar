@@ -1,8 +1,14 @@
 import os
 import time
+import cv2
+import subprocess
+import tempfile
+import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from pathlib import Path
 from torch import pi
 from torch.nn import Module
 from torch.utils import data
@@ -12,6 +18,14 @@ from generator.dataset import AudioMotionSmirkGazeDataset
 from FM import FMGenerator
 from options.base_options import BaseOptions
 from pytorch_lightning.loggers import TensorBoardLogger
+
+try:
+    from generator.generate import DataProcessor, load_smirk_params
+    from renderer.models import IMTRenderer
+    PREVIEW_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    PREVIEW_AVAILABLE = False
+    print("[WARNING] Preview not available (renderer/generate modules not found)")
 
 # ==========================================
 # 1. New EMA Class Helper
@@ -68,8 +82,16 @@ class System(pl.LightningModule):
         self.model = FMGenerator(opt)
         self.opt = opt
         self.loss_fn = L1loss()
-        
-        self.ema = EMA(self.model, decay=0.9999) 
+
+        self.ema = EMA(self.model, decay=0.9999)
+
+        # Preview support
+        self.preview_renderer = None
+        self.preview_processor = None
+        self.preview_data = None
+        self.last_preview_step = -1
+        self.last_preview_video_step = -1
+        self.preview_start_time = None 
 
     def forward(self, x):
         return self.model(x)
@@ -122,14 +144,181 @@ class System(pl.LightningModule):
         pred_flow_anchor = self.model(batch, t=times)
 
         fm_loss = self.loss_fn(pred_flow_anchor, gt_flow)
-        velocity_loss = self.loss_fn(pred_flow_anchor[:, 1:] - pred_flow_anchor[:, :-1], 
+        velocity_loss = self.loss_fn(pred_flow_anchor[:, 1:] - pred_flow_anchor[:, :-1],
                                      gt_flow[:, 1:] - gt_flow[:, :-1])
 
         val_loss = fm_loss + velocity_loss
 
         self.log("val_loss", val_loss, prog_bar=True)
         self.log("val_fm_loss", fm_loss, prog_bar=True)
-    
+
+    def on_validation_epoch_end(self):
+        """Generate preview videos after validation."""
+        if PREVIEW_AVAILABLE and self.trainer.is_global_zero:
+            self._log_preview()
+
+    def _init_preview(self):
+        """Initialize preview renderer and processor."""
+        if not PREVIEW_AVAILABLE or not self.opt.preview_ref_path or not self.opt.preview_aud_path:
+            return False
+        if self.preview_renderer is not None:
+            return True
+        if not os.path.exists(self.opt.renderer_path):
+            print(f"[WARNING] Preview disabled: renderer checkpoint not found at {self.opt.renderer_path}")
+            return False
+
+        self.preview_renderer = IMTRenderer(self.opt).to(self.device).eval()
+        renderer_ckpt = torch.load(self.opt.renderer_path, map_location="cpu")["state_dict"]
+        ae_state_dict = {k.replace("gen.", ""): v for k, v in renderer_ckpt.items() if k.startswith("gen.")}
+        self.preview_renderer.load_state_dict(ae_state_dict, strict=False)
+        self.preview_processor = DataProcessor(self.opt)
+        return True
+
+    @torch.no_grad()
+    def _load_preview_data(self):
+        """Load and cache preview data."""
+        if self.preview_data is not None:
+            return self.preview_data
+        if not self._init_preview():
+            return None
+
+        data = self.preview_processor.preprocess(
+            self.opt.preview_ref_path,
+            self.opt.preview_aud_path,
+            crop=self.opt.preview_crop,
+        )
+        data["s"] = data["s"].to(self.device)
+        data["a"] = data["a"].to(self.device)
+
+        if self.opt.preview_pose_path and os.path.exists(self.opt.preview_pose_path):
+            pose, cam = load_smirk_params(torch.load(self.opt.preview_pose_path, map_location="cpu"))
+            data["pose"] = pose.to(self.device)
+            data["cam"] = cam.to(self.device)
+        else:
+            data["pose"], data["cam"] = None, None
+
+        if self.opt.preview_gaze_path and os.path.exists(self.opt.preview_gaze_path):
+            gaze = torch.from_numpy(np.load(self.opt.preview_gaze_path)).float().to(self.device)
+            data["gaze"] = gaze
+        else:
+            data["gaze"] = None
+
+        self.preview_data = data
+        return data
+
+    @torch.no_grad()
+    def _log_preview(self):
+        """Generate preview images and videos."""
+        if not self.trainer.is_global_zero:
+            return
+        if self.global_step == 0:
+            return
+
+        need_image = (
+            self.opt.preview_every_n_val > 0
+            and self.global_step != self.last_preview_step
+            and self.global_step % self.opt.preview_every_n_val == 0
+        )
+        need_video = (
+            self.opt.preview_video_every_n_val > 0
+            and self.global_step != self.last_preview_video_step
+            and self.global_step % self.opt.preview_video_every_n_val == 0
+        )
+        if not need_image and not need_video:
+            return
+
+        data = self._load_preview_data()
+        if data is None:
+            return
+
+        self.preview_start_time = time.perf_counter()
+        self.model.eval()
+        f_r, g_r = self.preview_renderer.dense_feature_encoder(data["s"])
+        t_r = self.preview_renderer.latent_token_encoder(data["s"])
+        ta_r = self.preview_renderer.adapt(t_r, g_r)
+        m_r = self.preview_renderer.latent_token_decoder(ta_r)
+
+        sample_input = {
+            "a": data["a"],
+            "ref_x": t_r,
+            "pose": data["pose"],
+            "cam": data["cam"],
+            "gaze": data["gaze"],
+        }
+        sample = self.model.sample(
+            sample_input,
+            nfe=self.opt.nfe,
+            seed=self.opt.seed,
+        )
+
+        frames = []
+        for t in range(sample.shape[1]):
+            ta_c = self.preview_renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.preview_renderer.latent_token_decoder(ta_c)
+            frames.append(self.preview_renderer.decode(m_c, m_r, f_r))
+        frames = torch.stack(frames, dim=1)[0]
+
+        num_frames = frames.shape[0]
+        indices = sorted({0, num_frames // 2, num_frames - 1})
+        preview = torch.cat([frames[idx] for idx in indices], dim=2)
+        preview = ((preview.clamp(-1, 1) + 1) / 2).cpu()
+
+        if need_image and hasattr(self.logger, "experiment"):
+            self.logger.experiment.add_image("preview/generated_triplet", preview, self.global_step)
+            self.last_preview_step = self.global_step
+
+        if need_video:
+            self._save_preview_video(frames)
+            self.last_preview_video_step = self.global_step
+
+        if self.preview_start_time is not None:
+            preview_time = time.perf_counter() - self.preview_start_time
+            self.log("perf/preview_sec", preview_time, prog_bar=False, on_step=False, on_epoch=True)
+            print(
+                f"[TIMING] preview step={self.global_step} "
+                f"image={'yes' if need_image else 'no'} "
+                f"video={'yes' if need_video else 'no'} "
+                f"time={preview_time:.2f}s"
+            )
+
+        self.model.train()
+
+    def _save_preview_video(self, frames):
+        """Save preview video to disk."""
+        preview_dir = Path(self.opt.exp_path) / self.opt.exp_name / "preview_videos"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        out_path = preview_dir / f"step={self.global_step:06d}.mp4"
+
+        frames_uint8 = (
+            ((frames.clamp(-1, 1) + 1) * 127.5)
+            .byte()
+            .permute(0, 2, 3, 1)
+            .cpu()
+            .numpy()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, frame in enumerate(frames_uint8):
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(tmpdir, f"{idx:06d}.png"), frame_bgr)
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                str(self.opt.fps),
+                "-i",
+                os.path.join(tmpdir, "%06d.png"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(out_path),
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print(f"[INFO] Saved preview video to {out_path}")
+
     def load_ckpt(self, ckpt_path):
         print(f"[INFO] Loading weights from checkpoint: {ckpt_path}")
 
@@ -186,7 +375,17 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--display_freq", type=int, default=10000)
         parser.add_argument("--resume_ckpt", type=str, default=None)
         parser.add_argument("--rank", type=str, default="cuda")
-        
+        parser.add_argument("--renderer_path", type=str, default="./checkpoints/renderer.ckpt")
+        parser.add_argument("--preview_ref_path", type=str, default=None)
+        parser.add_argument("--preview_aud_path", type=str, default=None)
+        parser.add_argument("--preview_pose_path", type=str, default=None)
+        parser.add_argument("--preview_gaze_path", type=str, default=None)
+        parser.add_argument("--preview_crop", action="store_true")
+        parser.add_argument("--preview_every_n_val", type=int, default=5000)
+        parser.add_argument("--preview_video_every_n_val", type=int, default=15000)
+        parser.add_argument("--nfe", type=int, default=10, help="Number of ODE steps for sampling")
+        parser.add_argument("--seed", type=int, default=42)
+
         return parser
 
 class DataModule(pl.LightningDataModule):
@@ -217,9 +416,17 @@ if __name__ == '__main__':
         save_top_k=-1,
         save_last=True
     )
+    best_checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(opt.exp_path, opt.exp_name, 'checkpoints'),
+        filename="best-{step:06d}-{val_loss:.4f}",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=3,
+    )
+
     if opt.resume_ckpt and os.path.exists(opt.resume_ckpt):
         system.load_ckpt(opt.resume_ckpt)
-        
+
     trainer = pl.Trainer(
         accelerator='gpu',
         devices=-1,
@@ -228,7 +435,7 @@ if __name__ == '__main__':
         val_check_interval=opt.display_freq,
         check_val_every_n_epoch=None,
         logger=logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, best_checkpoint_callback],
         enable_progress_bar=True,
     )
 

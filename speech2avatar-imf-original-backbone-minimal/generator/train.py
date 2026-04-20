@@ -163,11 +163,53 @@ class System(pl.LightningModule):
         adp_wt = (loss + self.opt.norm_eps) ** self.opt.norm_p
         return loss / adp_wt.detach()
 
+    def _apply_batch_dropout(self, batch, device):
+        """Apply per-signal and previous-context dropout to the batch.
+
+        This mirrors the original IMTalker FMT's sequence_embedder dropout but is
+        applied once so all forward passes in the iMF multi-call loss see the same
+        masks, keeping gradient targets consistent.
+        """
+        if not self.training:
+            return batch
+        batch = dict(batch)  # shallow copy so we can replace tensors
+        bsz = batch["m_now"].shape[0]
+
+        # Per-signal dropout for pose/cam/gaze (audio handled separately by CFG)
+        drop_prob = self.opt.audio_dropout_prob
+        for key in ["pose", "cam", "gaze"]:
+            now_key = key if key in batch else f"{key}_now"
+            prev_key = f"{key}_prev"
+            mask = torch.rand(bsz, device=device) < drop_prob
+            if mask.any():
+                if now_key in batch:
+                    t = batch[now_key].clone()
+                    t[mask] = 0
+                    batch[now_key] = t
+                if prev_key in batch:
+                    t = batch[prev_key].clone()
+                    t[mask] = 0
+                    batch[prev_key] = t
+
+        # Previous-context dropout – drop ALL prev signals together
+        prev_mask = torch.rand(bsz, device=device) < self.opt.prev_dropout_prob
+        if prev_mask.any():
+            for key in ["m_prev", "a_prev", "pose_prev", "cam_prev", "gaze_prev"]:
+                if key in batch:
+                    t = batch[key].clone()
+                    t[prev_mask] = 0
+                    batch[key] = t
+
+        return batch
+
     def _compute_loss(self, batch):
         batch = self._prepare_batch(batch)
         x = batch["m_now"]
         batch_size = x.size(0)
         device = x.device
+
+        # Apply signal & prev-context dropout once (shared across all forward passes)
+        batch = self._apply_batch_dropout(batch, device)
 
         t, r, fm_mask = self._sample_tr(batch_size, device)
         noise = torch.randn_like(x)
@@ -217,37 +259,60 @@ class System(pl.LightningModule):
 
         audio_drop_mask = torch.rand(batch_size, device=device) < self.opt.audio_dropout_prob
         v_g = torch.where(append_dims(audio_drop_mask, v_g.ndim - 1), v_t, v_g)
-        v_c_for_jvp = torch.where(append_dims(audio_drop_mask, v_c.ndim - 1), v_t, v_c)
+
+        # FIX: JVP tangent must stay as the conditioned v_c (not replaced with v_t
+        # for audio-dropped samples).  The reference iMF only modifies v_g and the
+        # conditioning (labels / audio) for dropped samples — the tangent direction
+        # used in the JVP remains the conditioned prediction.
+        v_c_for_jvp = v_c
 
         h = t - r
 
-        def u_only(z_in, h_in):
-            local_batch = dict(batch_with_noise)
-            local_batch["m_now"] = z_in
-            return self.model(
-                local_batch,
-                h=h_in,
-                omega=omega,
-                t_min=t_min,
-                t_max=t_max,
-                zero_audio_mask=audio_drop_mask,
-                return_v=False,
+        # Run JVP and v-head prediction in fp32 to avoid bf16 numerical issues.
+        # Forward-mode AD accumulates tangent values through every op; bf16
+        # precision causes du_dt to be noisy, making loss_u unstable.
+        with torch.amp.autocast("cuda", enabled=False):
+            z_t_f = z_t.float()
+            h_f = h.float()
+            v_c_f = v_c_for_jvp.float()
+            omega_f = omega.float()
+            t_min_f = t_min.float()
+            t_max_f = t_max.float()
+
+            # Cast batch tensors to fp32 for the JVP pass
+            batch_fp32 = {
+                k: v.float() if torch.is_tensor(v) and v.is_floating_point() else v
+                for k, v in batch_with_noise.items()
+            }
+
+            def u_only(z_in, h_in):
+                local_batch = dict(batch_fp32)
+                local_batch["m_now"] = z_in
+                return self.model(
+                    local_batch,
+                    h=h_in,
+                    omega=omega_f,
+                    t_min=t_min_f,
+                    t_max=t_max_f,
+                    zero_audio_mask=audio_drop_mask,
+                    return_v=False,
+                )
+
+            u, du_dt = jvp(
+                u_only,
+                (z_t_f, h_f),
+                (v_c_f, torch.ones_like(h_f)),
             )
 
-        u, du_dt = jvp(
-            u_only,
-            (z_t, h),
-            (v_c_for_jvp, torch.ones_like(h)),
-        )
-        _, v = self.model(
-            batch_with_noise,
-            h=h,
-            omega=omega,
-            t_min=t_min,
-            t_max=t_max,
-            zero_audio_mask=audio_drop_mask,
-            return_v=True,
-        )
+            _, v = self.model(
+                batch_fp32,
+                h=h_f,
+                omega=omega_f,
+                t_min=t_min_f,
+                t_max=t_max_f,
+                zero_audio_mask=audio_drop_mask,
+                return_v=True,
+            )
 
         v_g = v_g.detach()
         V = u + append_dims(h, u.ndim - 1) * du_dt.detach()
@@ -263,6 +328,16 @@ class System(pl.LightningModule):
             "loss_u": ((V - v_g) ** 2).mean().detach(),
             "loss_v": ((v - v_g) ** 2).mean().detach(),
         }
+
+        # Temporal velocity smoothness loss (matches original IMTalker's velocity_loss)
+        if self.opt.lambda_vel > 0:
+            delta_V = V[:, 1:] - V[:, :-1]
+            delta_v = v[:, 1:] - v[:, :-1]
+            delta_vg = (v_g[:, 1:] - v_g[:, :-1]).detach()
+            vel_loss = torch.mean((delta_V - delta_vg) ** 2) + torch.mean((delta_v - delta_vg) ** 2)
+            loss = loss + self.opt.lambda_vel * vel_loss
+            metrics["vel_loss"] = vel_loss.detach()
+
         return loss, metrics
 
     def training_step(self, batch, batch_idx):
@@ -270,6 +345,13 @@ class System(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True)
         self.log("loss_u", metrics["loss_u"], prog_bar=True)
         self.log("loss_v", metrics["loss_v"], prog_bar=True)
+        if "vel_loss" in metrics:
+            self.log("vel_loss", metrics["vel_loss"], prog_bar=False)
+        # Log ground truth motion statistics periodically for reference
+        if batch_idx % 500 == 0:
+            gt = batch["m_now"]
+            self.log("stats/gt_motion_mean", gt.mean(), prog_bar=False)
+            self.log("stats/gt_motion_std", gt.std(), prog_bar=False)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -278,6 +360,8 @@ class System(pl.LightningModule):
         self.log("val_loss", loss, prog_bar=True)
         self.log("val_loss_u", metrics["loss_u"], prog_bar=True)
         self.log("val_loss_v", metrics["loss_v"], prog_bar=True)
+        if "vel_loss" in metrics:
+            self.log("val_vel_loss", metrics["vel_loss"], prog_bar=False)
 
     def _init_preview(self):
         if not self.opt.preview_ref_path or not self.opt.preview_aud_path:
@@ -356,9 +440,11 @@ class System(pl.LightningModule):
         ta_r = self.preview_renderer.adapt(t_r, g_r)
         m_r = self.preview_renderer.latent_token_decoder(ta_r)
 
+        # Normalize ref_x into the same space the model was trained in
+        t_r_norm = self.model._normalize_motion(t_r)
         sample_input = {
             "a": data["a"],
-            "ref_x": t_r,
+            "ref_x": t_r_norm,
             "pose": data["pose"],
             "cam": data["cam"],
             "gaze": data["gaze"],
@@ -470,7 +556,12 @@ class System(pl.LightningModule):
             print(f"[WARNING] {len(unmatched_keys)} keys skipped.")
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.model.parameters(), lr=self.opt.lr, betas=(0.9, 0.999))
+        optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=self.opt.lr,
+            betas=(0.9, 0.999),
+            weight_decay=self.opt.weight_decay,
+        )
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.opt.iter,
@@ -489,6 +580,9 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--dataset_path", default=None, type=str)
         parser.add_argument("--dataset_pat", dest="dataset_path", default=None, type=str, help=argparse.SUPPRESS)
         parser.add_argument("--lr", default=1e-4, type=float)
+        parser.add_argument("--weight_decay", default=0.01, type=float)
+        parser.add_argument("--freeze_frontend", action="store_true",
+                            help="Freeze audio/gaze/pose/cam projections (default: train them)")
         parser.add_argument("--batch_size", default=16, type=int)
         parser.add_argument("--iter", default=5000000, type=int)
         parser.add_argument("--exp_path", type=str, default="./exps")
@@ -509,7 +603,7 @@ class TrainOptions(BaseOptions):
         parser.add_argument("--preview_crop", action="store_true")
         parser.add_argument("--preview_every_n_val", type=int, default=5000)
         parser.add_argument("--preview_video_every_n_val", type=int, default=15000)
-        parser.add_argument("--preview_a_cfg_scale", type=float, default=1.0)
+        parser.add_argument("--preview_a_cfg_scale", type=float, default=3.0)
         parser.add_argument("--val_holdout", type=int, default=100)
         return parser
 
@@ -574,6 +668,19 @@ if __name__ == "__main__":
         save_top_k=-1,
         save_last=True,
     )
+    best_checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=os.path.join(opt.exp_path, opt.exp_name, "checkpoints"),
+        filename="best-{step:06d}-{val_loss_u:.4f}",
+        monitor="val_loss_u",
+        mode="min",
+        save_top_k=3,
+    )
+    early_stop_callback = pl.callbacks.EarlyStopping(
+        monitor="val_loss_u",
+        patience=10,
+        mode="min",
+        verbose=True,
+    )
 
     if opt.resume_ckpt and os.path.exists(opt.resume_ckpt):
         system.load_ckpt(opt.resume_ckpt)
@@ -586,7 +693,7 @@ if __name__ == "__main__":
         val_check_interval=opt.display_freq,
         check_val_every_n_epoch=None,
         logger=logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, best_checkpoint_callback, early_stop_callback],
         enable_progress_bar=True,
         precision=opt.precision,
     )

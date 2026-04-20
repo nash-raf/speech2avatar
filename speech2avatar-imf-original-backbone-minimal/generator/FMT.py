@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.layers import use_fused_attn
+from timm.layers import use_fused_attn, DropPath
 from timm.models.vision_transformer import Mlp
 
 
@@ -147,7 +147,7 @@ class SequenceEmbed(nn.Module):
 
 
 class FMTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop_path=0.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
@@ -159,6 +159,7 @@ class FMTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     @staticmethod
     def framewise_modulate(x, shift, scale):
@@ -166,8 +167,8 @@ class FMTBlock(nn.Module):
 
     def forward(self, x, c, rotary_pos_emb=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(self.framewise_modulate(self.norm1(x), shift_msa, scale_msa), rotary_pos_emb)
-        x = x + gate_mlp * self.mlp(self.framewise_modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + self.drop_path(gate_msa * self.attn(self.framewise_modulate(self.norm1(x), shift_msa, scale_msa), rotary_pos_emb))
+        x = x + self.drop_path(gate_mlp * self.mlp(self.framewise_modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
 
 
@@ -217,9 +218,29 @@ class FlowMatchingTransformer(nn.Module):
         self.t_max_embedder = TimestepEmbedder(self.hidden_size)
         self.c_embedder = nn.Linear(opt.dim_c, self.hidden_size)
 
-        self.blocks = nn.ModuleList(
-            [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio) for _ in range(self.fmt_depth)]
+        # Split blocks into shared backbone + separate head blocks (matches reference iMF).
+        # The u-head needs its own transformer blocks to learn the "average velocity"
+        # concept required for 1-step generation.  A single linear decoder is not enough.
+        aux_head_depth = getattr(opt, "aux_head_depth", 4)
+        shared_depth = self.fmt_depth - aux_head_depth
+        assert shared_depth >= 0, (
+            f"fmt_depth ({self.fmt_depth}) must be >= aux_head_depth ({aux_head_depth})"
         )
+
+        drop_path_rate = getattr(opt, "drop_path_rate", 0.0)
+        # Linearly increasing drop path across all blocks
+        total_depth = self.fmt_depth + aux_head_depth  # shared + head (heads run in parallel)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
+
+        def _make_blocks(n, dpr_slice):
+            return nn.ModuleList(
+                [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio, drop_path=dpr_slice[i]) for i in range(n)]
+            )
+
+        self.shared_blocks = _make_blocks(shared_depth, dpr[:shared_depth])
+        self.u_head_blocks = _make_blocks(aux_head_depth, dpr[shared_depth:])
+        self.v_head_blocks = _make_blocks(aux_head_depth, dpr[shared_depth:])
+
         self.decoder = Decoder(self.hidden_size, self.opt.dim_motion)
         self.v_decoder = Decoder(self.hidden_size, self.opt.dim_motion)
         self.initialize_weights()
@@ -241,9 +262,10 @@ class FlowMatchingTransformer(nn.Module):
             nn.init.normal_(embedder.mlp[0].weight, std=0.02)
             nn.init.normal_(embedder.mlp[2].weight, std=0.02)
 
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for block_list in [self.shared_blocks, self.u_head_blocks, self.v_head_blocks]:
+            for block in block_list:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         for decoder in [self.decoder, self.v_decoder]:
             nn.init.constant_(decoder.adaLN_modulation[-1].weight, 0)
@@ -295,12 +317,23 @@ class FlowMatchingTransformer(nn.Module):
         scalar_cond = scalar_cond + self.t_max_embedder(t_max)
         c = cond + scalar_cond.unsqueeze(1)
 
-        for block in self.blocks:
+        # Shared backbone
+        for block in self.shared_blocks:
             x = block(x, c, rotary_pos_emb=rotary_pos_emb)
 
-        u = self.decoder(x, c)
+        # u-head: separate transformer blocks + decoder
+        u_x = x
+        for block in self.u_head_blocks:
+            u_x = block(u_x, c, rotary_pos_emb=rotary_pos_emb)
+        u = self.decoder(u_x, c)
+
         if not return_v:
             return u
 
-        v = self.v_decoder(x, c)
+        # v-head: separate transformer blocks + decoder
+        v_x = x
+        for block in self.v_head_blocks:
+            v_x = block(v_x, c, rotary_pos_emb=rotary_pos_emb)
+        v = self.v_decoder(v_x, c)
+
         return u, v
